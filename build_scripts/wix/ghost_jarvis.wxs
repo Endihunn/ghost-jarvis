@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Ghost Jarvis"
+           Manufacturer="GhostLabs"
+           Version="1.0.0"
+           UpgradeCode="A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
+           Scope="perMachine">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Ghost Jarvis is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="MainFeature" Title="Ghost Jarvis" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentGroupRef Id="ShortcutComponents" />
+    </Feature>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="GhostJarvis">
+        <Component Id="MainExecutable" Guid="*">
+          <File Id="GhostJarvisExe" Source="$(var.PyInstallerDistDir)\GhostJarvis.exe" KeyPath="yes" />
+        </Component>
+        <ComponentGroupRef Id="PyInstallerFiles" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Ghost Jarvis">
+        <Component Id="ApplicationShortcut" Guid="*">
+          <Shortcut Id="ApplicationStartMenuShortcut"
+                    Name="Ghost Jarvis"
+                    Description="Voice interface for AI agents"
+                    Target="[#GhostJarvisExe]"
+                    WorkingDirectory="INSTALLFOLDER" />
+          <RemoveFolder Id="ApplicationProgramsFolder" On="uninstall" />
+          <RegistryValue Root="HKMU" Key="Software\GhostLabs\GhostJarvis"
+                         Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="*">
+        <Shortcut Id="DesktopShortcut"
+                  Name="Ghost Jarvis"
+                  Description="Voice interface for AI agents"
+                  Target="[#GhostJarvisExe]"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKMU" Key="Software\GhostLabs\GhostJarvis"
+                       Name="desktop" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <ComponentRef Id="MainExecutable" />
+    </ComponentGroup>
+
+    <ComponentGroup Id="ShortcutComponents">
+      <ComponentRef Id="ApplicationShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </ComponentGroup>
+
+    <!-- PyInstaller output is harvested via heat or included as a payload -->
+    <ComponentGroup Id="PyInstallerFiles" Directory="INSTALLFOLDER">
+      <!-- In a real build, use `heat dir` to harvest the PyInstaller dist folder -->
+    </ComponentGroup>
+  </Fragment>
+</Wix>

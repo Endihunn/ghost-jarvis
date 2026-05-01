@@ -1,0 +1,136 @@
+name: Build Installers
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version string (e.g. 1.0.0)'
+        required: true
+        default: '1.0.0'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Cache Whisper model
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: whisper-small-${{ runner.os }}
+
+      - name: Download Whisper model (if not cached)
+        run: |
+          python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8', download_root='models')"
+
+      - name: Build PyInstaller bundle
+        run: pyinstaller build_scripts/common/ghost_jarvis.spec --clean --noconfirm
+
+      - name: Build MSI
+        run: |
+          dotnet tool install --global wix --version 4.0.5
+          $env:Path += ";${env:LOCALAPPDATA}\Microsoft\WindowsApps"
+          build_scripts/build_windows.ps1 -Version ${{ github.event.inputs.version || github.ref_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-msi
+          path: dist/*.msi
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install system deps
+        run: brew install portaudio
+
+      - name: Install Python deps
+        run: |
+          pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Cache Whisper model
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: whisper-small-${{ runner.os }}
+
+      - name: Download Whisper model (if not cached)
+        run: |
+          python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8', download_root='models')"
+
+      - name: Build bundle + PKG
+        run: |
+          chmod +x build_scripts/build_macos.sh
+          build_scripts/build_macos.sh ${{ github.event.inputs.version || github.ref_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-pkg
+          path: dist/*.pkg
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y portaudio19-dev ruby ruby-dev
+          sudo gem install fpm
+
+      - name: Install Python deps
+        run: |
+          pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Cache Whisper model
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: whisper-small-${{ runner.os }}
+
+      - name: Download Whisper model (if not cached)
+        run: |
+          python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8', download_root='models')"
+
+      - name: Build bundle + deb/rpm
+        run: |
+          chmod +x build_scripts/build_linux.sh
+          build_scripts/build_linux.sh ${{ github.event.inputs.version || github.ref_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
