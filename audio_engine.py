@@ -820,10 +820,16 @@ class AudioEngine(QObject):
                     if cache_path.exists():
                         snd = pygame.mixer.Sound(str(cache_path))
                         channel = snd.play()
-                        if channel:
+                        if channel is None:
+                            logger.warning("speak_local: no free channel for %s, forcing one", cache_path.name)
+                            channel = pygame.mixer.find_channel(force=True)
+                            if channel is not None:
+                                channel.play(snd)
+                        if channel is not None:
                             while channel.get_busy() and self._running:
                                 time_mod.sleep(0.05)
-                        return
+                            return
+                        logger.warning("speak_local: could not acquire channel, falling back to pyttsx3 say()")
                     # Fallback if save_to_file did not produce a file
                     self.tts_local.say(text)
                     self.tts_local.runAndWait()
