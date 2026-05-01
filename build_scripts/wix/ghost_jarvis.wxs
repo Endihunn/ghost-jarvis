@@ -17,9 +17,8 @@
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="GhostJarvis">
         <Component Id="MainExecutable" Guid="*">
-          <File Id="GhostJarvisExe" Source="$(var.PyInstallerDistDir)\GhostJarvis.exe" KeyPath="yes" />
+          <File Id="GhostJarvisExe" Source="dist\GhostJarvis.exe" KeyPath="yes" />
         </Component>
-        <ComponentGroupRef Id="PyInstallerFiles" />
       </Directory>
     </StandardDirectory>
 
@@ -60,11 +59,6 @@
     <ComponentGroup Id="ShortcutComponents">
       <ComponentRef Id="ApplicationShortcut" />
       <ComponentRef Id="DesktopShortcut" />
-    </ComponentGroup>
-
-    <!-- PyInstaller output is harvested via heat or included as a payload -->
-    <ComponentGroup Id="PyInstallerFiles" Directory="INSTALLFOLDER">
-      <!-- In a real build, use `heat dir` to harvest the PyInstaller dist folder -->
     </ComponentGroup>
   </Fragment>
 </Wix>

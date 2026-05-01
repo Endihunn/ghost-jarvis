@@ -69,15 +69,17 @@ a = Analysis(
 # Strip large debug symbols if any
 pyz = PYZ(a.pure, a.zipped_data)
 
-# macOS .app bundle uses BUNDLE instead of EXE+COLLECT, but PyInstaller
-# handles that automatically when building on macOS.  For Windows/Linux we
-# use one-folder mode (COLLECT) which is faster to start than one-file.
+# One-file bundle for simpler installer packaging.
+# The single .exe contains all binaries, datas, and Python libs.
 
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
     [],
-    exclude_binaries=True,
+    exclude_binaries=False,
     name="GhostJarvis",
     debug=False,
     bootloader_ignore_signals=False,
@@ -90,15 +92,4 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=str(ROOT / "assets" / "icon.ico") if sys.platform == "win32" else None,
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name="GhostJarvis",
 )
