@@ -37,7 +37,7 @@ log_config.setup_logging()
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QRect
 from PyQt6.QtGui import QIcon, QAction, QPixmap, QPainter, QColor
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QMainWindow, QSystemTrayIcon, QMenu, QMessageBox, QStyle
+    QApplication, QDialog, QMainWindow, QSystemTrayIcon, QMenu, QMessageBox, QStyle, QWizard
 )
 from PyQt6.QtGui import QSurfaceFormat
 
