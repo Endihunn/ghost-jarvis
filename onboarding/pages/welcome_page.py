@@ -4,15 +4,16 @@ from PyQt6.QtCore import Qt
 
 
 class WelcomePage(QWizardPage):
-    def __init__(self, parent=None):
+    def __init__(self, agent_name: str = "Ghost", parent=None):
         super().__init__(parent)
-        self.setTitle("Bienvenido a Ghost Jarvis")
+        self._agent_name = agent_name
+        self.setTitle(f"Bienvenido a {agent_name} Jarvis")
         self.setSubTitle("Tu interfaz de voz tipo J.A.R.V.I.S.")
 
         layout = QVBoxLayout(self)
 
         info = QLabel(
-            "Ghost Jarvis escucha continuamente y te permite interactuar "
+            f"{agent_name} Jarvis escucha continuamente y te permite interactuar "
             "con tu agente AI mediante comandos de voz.<br><br>"
             "Vamos a configurar tu agente y calibrar el audio en unos pocos pasos."
         )
@@ -20,7 +21,7 @@ class WelcomePage(QWizardPage):
         info.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(info)
 
-        self._autostart = QCheckBox("Iniciar Ghost Jarvis con el sistema")
+        self._autostart = QCheckBox(f"Iniciar {agent_name} Jarvis con el sistema")
         self._autostart.setChecked(True)
         layout.addWidget(self._autostart)
 

@@ -42,6 +42,7 @@ class Config:
     openclaw_cmd: str = field(default_factory=_default_openclaw_cmd)
     openclaw_config: str = field(default_factory=_default_openclaw_config)
     ghost_prompt_prefix: str = ""
+    agent_name: str = "Ghost"
 
     # Gateway connection
     gateway_url: str = "ws://127.0.0.1:18789"

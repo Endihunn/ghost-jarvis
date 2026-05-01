@@ -7,15 +7,16 @@ from PyQt6.QtCore import Qt
 
 
 class AudioPage(QWizardPage):
-    def __init__(self, parent=None):
+    def __init__(self, agent_name: str = "Ghost", parent=None):
         super().__init__(parent)
+        self._agent_name = agent_name
         self.setTitle("Calibrar Audio")
         self.setSubTitle("Ajusta el micrófono y las frases de despertar.")
 
         layout = QVBoxLayout(self)
 
         info = QLabel(
-            "Ghost Jarvis escucha continuamente. Ajusta la ganancia para que "
+            f"{agent_name} Jarvis escucha continuamente. Ajusta la ganancia para que "
             "tu voz se detecte claramente sin capturar ruido de fondo.<br><br>"
             "Puedes cambiar estos ajustes más tarde desde Configuración."
         )
@@ -49,8 +50,8 @@ class AudioPage(QWizardPage):
         wake_group = QGroupBox("Frases de despertar (wake words)")
         wake_layout = QVBoxLayout(wake_group)
         wake_info = QLabel(
-            "Por defecto Ghost responde a:<br>"
-            "<i>oye ghost, ey ghost, ghost, jarvis</i><br><br>"
+            f"Por defecto {agent_name} responde a:<br>"
+            f"<i>oye {agent_name.lower()}, ey {agent_name.lower()}, {agent_name.lower()}, jarvis</i><br><br>"
             "Puedes personalizarlas desde Configuración después del setup."
         )
         wake_info.setTextFormat(Qt.TextFormat.RichText)

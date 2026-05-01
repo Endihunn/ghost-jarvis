@@ -4,10 +4,11 @@ from PyQt6.QtCore import Qt
 
 
 class FinishPage(QWizardPage):
-    def __init__(self, parent=None):
+    def __init__(self, agent_name: str = "Ghost", parent=None):
         super().__init__(parent)
+        self._agent_name = agent_name
         self.setTitle("Todo listo")
-        self.setSubTitle("Ghost Jarvis está configurado y listo para usar.")
+        self.setSubTitle(f"{agent_name} Jarvis está configurado y listo para usar.")
 
         layout = QVBoxLayout(self)
 
@@ -16,7 +17,7 @@ class FinishPage(QWizardPage):
         self._summary.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(self._summary)
 
-        self._autostart = QCheckBox("Iniciar Ghost Jarvis con el sistema")
+        self._autostart = QCheckBox(f"Iniciar {agent_name} Jarvis con el sistema")
         self._autostart.setChecked(True)
         layout.addWidget(self._autostart)
 

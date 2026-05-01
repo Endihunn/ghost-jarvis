@@ -6,6 +6,18 @@ from pathlib import Path
 import win32com.client
 
 
+def _app_label() -> str:
+    """Return the user-visible app name based on agent_name config."""
+    try:
+        from config import APP_CONFIG
+        name = APP_CONFIG.agent_name.strip()
+        if name:
+            return f"{name} Jarvis"
+    except Exception:
+        pass
+    return "Ghost Jarvis"
+
+
 def get_startup_folder() -> Path:
     appdata = os.environ.get("APPDATA")
     return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
@@ -50,33 +62,45 @@ def _resolve_target():
 def install_startup():
     startup = get_startup_folder()
     startup.mkdir(parents=True, exist_ok=True)
-    lnk = startup / "Ghost Jarvis.lnk"
+    label = _app_label()
+    lnk = startup / f"{label}.lnk"
     target, args, work_dir, icon = _resolve_target()
     _create_shortcut(lnk, target, args, work_dir, icon)
     return lnk
 
 
 def remove_startup():
-    lnk = get_startup_folder() / "Ghost Jarvis.lnk"
+    label = _app_label()
+    lnk = get_startup_folder() / f"{label}.lnk"
     if lnk.exists():
         lnk.unlink()
+    # Also clean up legacy name if present
+    legacy = get_startup_folder() / "Ghost Jarvis.lnk"
+    if legacy.exists():
+        legacy.unlink()
 
 
 def install_desktop():
     desktop = get_desktop_folder()
     desktop.mkdir(parents=True, exist_ok=True)
-    lnk = desktop / "Ghost Jarvis.lnk"
+    label = _app_label()
+    lnk = desktop / f"{label}.lnk"
     target, args, work_dir, icon = _resolve_target()
     _create_shortcut(lnk, target, args, work_dir, icon)
     return lnk
 
 
 def remove_desktop():
-    lnk = get_desktop_folder() / "Ghost Jarvis.lnk"
+    label = _app_label()
+    lnk = get_desktop_folder() / f"{label}.lnk"
     if lnk.exists():
         lnk.unlink()
+    # Also clean up legacy name if present
+    legacy = get_desktop_folder() / "Ghost Jarvis.lnk"
+    if legacy.exists():
+        legacy.unlink()
 
 
 if __name__ == "__main__":
     install_startup()
-    print("Ghost Jarvis agregado al inicio de Windows.")
+    print(f"{_app_label()} agregado al inicio de Windows.")

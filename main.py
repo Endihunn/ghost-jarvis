@@ -61,7 +61,7 @@ OVERLAY_HEIGHT = APP_CONFIG.overlay_height
 class GhostJarvisApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Ghost Jarvis")
+        self.setWindowTitle(f"{APP_CONFIG.agent_name} Jarvis")
         self._position_overlay()
         self._drag_pos = self.pos()
         self.setWindowFlags(
@@ -260,7 +260,7 @@ class GhostJarvisApp(QMainWindow):
             State.SPEAKING: "Hablando...",
         }
         label = status_map.get(state, state.name)
-        self.tray.setToolTip(f"Ghost Jarvis — {label}")
+        self.tray.setToolTip(f"{APP_CONFIG.agent_name} Jarvis — {label}")
 
     def _build_tray_menu(self) -> QMenu:
         """Build the context menu shared by the tray icon and the overlay."""
@@ -421,7 +421,7 @@ class GhostJarvisApp(QMainWindow):
         if state == State.STANDBY:
             has_wake, _ = _check_wake(text)
             if has_wake:
-                self.audio.speak_local("Ghost en espera. El agente aún no está disponible.", blocking=False)
+                self.audio.speak_local(f"{APP_CONFIG.agent_name} en espera. El agente aún no está disponible.", blocking=False)
             else:
                 if not APP_CONFIG.privacy_mode:
                     logging.getLogger("state").debug("STANDBY ignore: %s", text)
@@ -487,7 +487,7 @@ class GhostJarvisApp(QMainWindow):
             self.sm.transition(State.STANDBY)
             self._standby_timer.start(30000)
             return
-        self.sm.context.ghost_response = f"Error al contactar a Ghost: {error}"
+        self.sm.context.ghost_response = f"Error al contactar a {APP_CONFIG.agent_name}: {error}"
         self.sm.transition(State.SPEAKING)
 
     def _update_speech_volume(self):
@@ -521,7 +521,7 @@ class GhostJarvisApp(QMainWindow):
             checker.start()
 
     def _on_agent_connected(self):
-        self.audio.speak_local("Ghost conectado.", blocking=False)
+        self.audio.speak_local(f"{APP_CONFIG.agent_name} conectado.", blocking=False)
         self.sm.transition(State.IDLE)
         self._standby_timer.stop()
 
@@ -558,7 +558,7 @@ class GhostJarvisApp(QMainWindow):
         event.ignore()
         self.hide()
         self.tray.showMessage(
-            "Ghost Jarvis",
+            f"{APP_CONFIG.agent_name} Jarvis",
             "La app sigue corriendo en la bandeja. Haz doble clic para mostrarla.",
             QSystemTrayIcon.MessageIcon.Information,
             2000,

@@ -3,6 +3,7 @@ import logging
 from PyQt6.QtWidgets import QWizard
 
 from config import APP_CONFIG
+from onboarding.detector import get_local_agent_name
 from onboarding.pages import WelcomePage, AgentPage, AudioPage, FinishPage
 from startup_installer import install_startup, remove_startup
 
@@ -12,13 +13,14 @@ logger = logging.getLogger("onboarding")
 class OnboardingWizard(QWizard):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Ghost Jarvis — Configuración inicial")
+        self._agent_name = APP_CONFIG.agent_name or get_local_agent_name()
+        self.setWindowTitle(f"{self._agent_name} Jarvis — Configuración inicial")
         self.setMinimumSize(640, 520)
 
-        self._welcome = WelcomePage()
+        self._welcome = WelcomePage(self._agent_name)
         self._agent = AgentPage()
-        self._audio = AudioPage()
-        self._finish = FinishPage()
+        self._audio = AudioPage(self._agent_name)
+        self._finish = FinishPage(self._agent_name)
 
         self.addPage(self._welcome)
         self.addPage(self._agent)
@@ -34,7 +36,7 @@ class OnboardingWizard(QWizard):
                 f"<b>Agente:</b> {agent_cfg.get('gateway_url', 'N/A')}<br>"
                 f"<b>Session key:</b> {agent_cfg.get('session_key', 'auto')}<br><br>"
                 f"Haz clic en <b>Finalizar</b> para guardar la configuración "
-                f"y empezar a usar Ghost Jarvis."
+                f"y empezar a usar {self._agent_name} Jarvis."
             )
             self._finish.set_summary(summary)
 
@@ -60,6 +62,7 @@ class OnboardingWizard(QWizard):
 
             APP_CONFIG.mic_auto_gain = audio_cfg.get("mic_auto_gain", True)
             APP_CONFIG.mic_gain = audio_cfg.get("mic_gain", 2.5)
+            APP_CONFIG.agent_name = self._agent_name
 
             APP_CONFIG.save()
             logger.info("Onboarding config saved.")
