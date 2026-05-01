@@ -258,6 +258,9 @@ class AudioEngine(QObject):
         # Sound cache — 24000 Hz matches edge-tts native rate
         try:
             pygame.mixer.init(frequency=24000, size=-16, channels=1, buffer=512)
+            # Default is 8; bump to 16 so rapid state-machine sounds (listen_on,
+            # listen_off, ready) can't starve the agent's voice playback.
+            pygame.mixer.set_num_channels(16)
         except pygame.error:
             pass
         self._sounds: dict[str, pygame.mixer.Sound] = {}
@@ -751,9 +754,16 @@ class AudioEngine(QObject):
             try:
                 snd = pygame.mixer.Sound(str(path))
                 channel = snd.play()
-                if channel:
+                if channel is None:
+                    logger.warning("mp3 play: no free channel for %s, forcing one", path.name)
+                    channel = pygame.mixer.find_channel(force=True)
+                    if channel is not None:
+                        channel.play(snd)
+                if channel is not None:
                     while channel.get_busy() and self._running:
                         time_mod.sleep(0.05)
+                else:
+                    logger.error("mp3 play: could not acquire channel for %s", path.name)
             except Exception as e:
                 logger.error("mp3 play error: %s", e)
             finally:
@@ -966,9 +976,17 @@ class AudioEngine(QObject):
 
                 snd = pygame.mixer.Sound(str(final_path))
                 channel = snd.play()
-                if channel:
+                if channel is None:
+                    logger.warning("speak_agent: no free channel for %s, forcing one", final_path.name)
+                    channel = pygame.mixer.find_channel(force=True)
+                    if channel is not None:
+                        channel.play(snd)
+                if channel is not None:
                     while channel.get_busy() and self._running:
                         time_mod.sleep(0.05)
+                else:
+                    logger.error("speak_agent: could not acquire channel for %s — falling back to local TTS", final_path.name)
+                    self.speak_local(text, blocking=True)
             except Exception as e:
                 logger.error("edge-tts error: %s", e)
                 self.speak_local(text, blocking=True)
