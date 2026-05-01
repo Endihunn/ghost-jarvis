@@ -6,7 +6,6 @@ pyttsx3>=2.90
 edge-tts>=6.1.0
 pygame>=2.5
 numpy>=1.26
-pywin32>=306
 PyOpenGL>=3.1.0
 torch>=2.11.0
 torchaudio>=2.11.0
@@ -15,3 +14,4 @@ pydub>=0.25.0
 cryptography>=42.0
 rapidfuzz>=3.0
 platformdirs>=4.0
+pywin32>=306; sys_platform == 'win32'

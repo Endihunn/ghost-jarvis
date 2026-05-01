@@ -3,8 +3,6 @@ import os
 import sys
 from pathlib import Path
 
-import win32com.client
-
 
 def _app_label() -> str:
     """Return the user-visible app name based on agent_name config."""
@@ -29,6 +27,7 @@ def get_desktop_folder() -> Path:
 
 
 def _create_shortcut(lnk_path: Path, target: Path, arguments: str = "", work_dir: str = "", icon: str = ""):
+    import win32com.client
     shell = win32com.client.Dispatch("WScript.Shell")
     shortcut = shell.CreateShortcut(str(lnk_path))
     shortcut.TargetPath = str(target)
