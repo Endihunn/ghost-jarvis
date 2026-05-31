@@ -1,8 +1,11 @@
-"""Bridge to Ghost agent via OpenClaw Gateway WebSocket (Protocol 3).
+"""Bridge to Ghost agent via OpenClaw Gateway WebSocket (Protocol 4).
 
-Auth flow:
+Auth flow (Protocol 4 trusted backend-client on loopback):
   - HTTP Bearer token (gateway_token) in WS upgrade header
-  - connect.challenge nonce → ED25519-signed device payload → hello-ok
+  - connect.challenge nonce received and acknowledged
+  - connect req with client.mode="backend" + shared token → ok (no device
+    signature; the gateway grants the requested operator scopes from the
+    token alone over the loopback bind)
   - chat.send + streaming chat events (state: delta/final)
 
 One in-flight request at a time (matches ghost-jarvis usage pattern).
@@ -32,74 +35,6 @@ logger = logging.getLogger("ghost")
 class CancelledError(Exception):
     """Raised when a Ghost request is cancelled by the user."""
     pass
-
-# ---------------------------------------------------------------------------
-# Device identity (loaded once, cached)
-# ---------------------------------------------------------------------------
-
-_device_identity: Optional[dict] = None
-_device_identity_lock = threading.Lock()
-
-
-def _load_device_identity() -> Optional[dict]:
-    global _device_identity
-    if _device_identity is not None:
-        return _device_identity
-    with _device_identity_lock:
-        if _device_identity is not None:
-            return _device_identity
-        try:
-            from cryptography.hazmat.primitives.serialization import (
-                load_pem_private_key, Encoding, PublicFormat
-            )
-            identity_dir = Path.home() / ".openclaw" / "identity"
-            device = json.loads((identity_dir / "device.json").read_text(encoding="utf-8"))
-            auth_data = json.loads((identity_dir / "device-auth.json").read_text(encoding="utf-8"))
-
-            private_key = load_pem_private_key(device["privateKeyPem"].encode(), password=None)
-            pub_raw = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-
-            operator_entry = auth_data.get("tokens", {}).get("operator", {})
-            _device_identity = {
-                "device_id": device["deviceId"],
-                "private_key": private_key,
-                "pub_key_b64url": base64.urlsafe_b64encode(pub_raw).rstrip(b"=").decode(),
-                "device_token": operator_entry.get("token", ""),
-            }
-            logger.info("Device identity loaded: %s...", device["deviceId"][:16])
-            return _device_identity
-        except Exception as e:
-            logger.warning("Device identity unavailable: %s", e)
-            return None
-
-
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
-
-
-def _build_signed_device_auth(nonce: str, gateway_token: str) -> Optional[dict]:
-    """Build the signed `device` object for the connect params."""
-    ident = _load_device_identity()
-    if not ident:
-        return None
-    client_id = "cli"
-    client_mode = "cli"
-    role = "operator"
-    scopes = "operator.admin"
-    signed_at_ms = int(time.time() * 1000)
-    payload_str = "|".join([
-        "v3", ident["device_id"], client_id, client_mode,
-        role, scopes, str(signed_at_ms), gateway_token, nonce, "win32", ""
-    ])
-    sig = ident["private_key"].sign(payload_str.encode("utf-8"))
-    return {
-        "id": ident["device_id"],
-        "publicKey": ident["pub_key_b64url"],
-        "signature": _b64url(sig),
-        "signedAt": signed_at_ms,
-        "nonce": nonce,
-    }
-
 
 # ---------------------------------------------------------------------------
 # HTTP health check
@@ -136,6 +71,25 @@ def is_agent_available(timeout: float = 5.0) -> bool:
 
 def _get_token() -> str:
     return APP_CONFIG.gateway_token or ""
+
+
+# ---------------------------------------------------------------------------
+# Session-key normalization
+# ---------------------------------------------------------------------------
+
+def _qualified_session_key(session_key: str, agent_id: str = "main") -> str:
+    """Return the fully qualified sessionKey the gateway echoes on chat events.
+
+    The gateway prefixes ``agent:<agentId>:`` to bare keys before echoing
+    them back in event payloads. If we register pending entries under the
+    bare key while the server reports the prefixed one, the recv loop
+    drops every chunk and the send waits until timeout.
+    """
+    if not session_key:
+        return ""
+    if ":" in session_key:
+        return session_key
+    return f"agent:{agent_id}:{session_key}"
 
 
 # ---------------------------------------------------------------------------
@@ -229,10 +183,10 @@ def _ws_ping(sock: socket.socket, payload: bytes, lock: threading.Lock) -> None:
 # ---------------------------------------------------------------------------
 
 class GatewayWS:
-    """Persistent WebSocket client for the OpenClaw gateway (Protocol 3).
+    """Persistent WebSocket client for the OpenClaw gateway (Protocol 4).
 
     Uses:
-      - ED25519-signed device identity for operator.admin scope
+      - Token-only backend-client auth (loopback bind grants operator scopes)
       - chat.send method + chat streaming events
       - TCP keepalive + client-side ping every 30s for half-open detection
     """
@@ -251,7 +205,7 @@ class GatewayWS:
         self._pending: dict[str, dict] = {}
         self._pending_lock = threading.Lock()
 
-    def connect(self, timeout: float = 10.0) -> bool:
+    def connect(self, timeout: float = 30.0) -> bool:
         with self._state_lock:
             if self._connected:
                 return True
@@ -308,23 +262,24 @@ class GatewayWS:
                     nonce = msg.get("payload", {}).get("nonce", nonce)
                     break
 
-            # Build device auth (ED25519 signature)
-            ident = _load_device_identity()
-            device_obj = _build_signed_device_auth(nonce, token)
-
+            # Trusted backend client on direct loopback: the gateway grants the
+            # requested operator scopes from the shared token alone and the device
+            # block may be omitted (gateway protocol v4). We deliberately do NOT
+            # attach a signed `device` object here: its signature payload would
+            # have to match client.id/mode/scopes exactly, and any drift yields
+            # DEVICE_AUTH_SIGNATURE_INVALID. Omitting it keeps the loopback path
+            # robust against device-auth.json drift.
             connect_id = str(uuid.uuid4())
             connect_params: dict = {
-                "minProtocol": 3, "maxProtocol": 3,
+                "minProtocol": 4, "maxProtocol": 4,
                 "client": {
-                    "id": "cli", "version": "1.0",
-                    "platform": "win32", "mode": "cli",
+                    "id": "gateway-client", "version": "1.0",
+                    "platform": "win32", "mode": "backend",
                 },
-                "scopes": ["operator.admin"],
+                "role": "operator",
+                "scopes": ["operator.read", "operator.write", "operator.admin"],
                 "auth": {"token": token},
             }
-            if ident and device_obj:
-                connect_params["auth"]["deviceToken"] = ident["device_token"]
-                connect_params["device"] = device_obj
 
             _ws_send_text(sock, json.dumps({
                 "type": "req", "id": connect_id, "method": "connect",
@@ -369,7 +324,7 @@ class GatewayWS:
                 target=self._ping_loop, daemon=True, name="gw-ping"
             )
             self._ping_thread.start()
-            logger.info("Gateway WS connected (protocol 3) to %s:%s", host, port)
+            logger.info("Gateway WS connected (protocol 4) to %s:%s", host, port)
             return True
 
         except Exception as e:
@@ -397,6 +352,10 @@ class GatewayWS:
     ) -> str:
         if not self._connected:
             raise ConnectionError("Not connected to gateway")
+
+        # Gateway echoes the key prefixed with "agent:<agentId>:"; align so
+        # _pending lookups in _recv_loop match. See _qualified_session_key.
+        session_key = _qualified_session_key(session_key, agent_id)
 
         run_id = str(uuid.uuid4())   # idempotencyKey for the chat run
         req_id = str(uuid.uuid4())   # ID for the chat.send res frame
@@ -614,7 +573,7 @@ class GhostWorker(QThread):
 
         if not _gateway.is_connected():
             logger.info("GhostWorker: gateway not connected, attempting reconnect...")
-            if not _gateway.connect(timeout=10.0):
+            if not _gateway.connect(timeout=30.0):
                 self.error_occurred.emit("no encontrado")
                 return
 
@@ -697,7 +656,7 @@ class GhostBridge:
     def send(self, prompt: str, on_response: Callable, on_error: Callable) -> None:
         if self._current_worker and self._current_worker.isRunning():
             self._current_worker.cancel()
-            _gateway.cancel(APP_CONFIG.session_key)
+            _gateway.cancel(_qualified_session_key(APP_CONFIG.session_key))
             self._current_worker.wait(2000)
 
         worker = GhostWorker(prompt)
@@ -716,7 +675,7 @@ class GhostBridge:
         """
         if self._current_worker and self._current_worker.isRunning():
             self._current_worker.cancel()
-            _gateway.cancel(APP_CONFIG.session_key)
+            _gateway.cancel(_qualified_session_key(APP_CONFIG.session_key))
 
     def close(self) -> None:
         global _gateway
