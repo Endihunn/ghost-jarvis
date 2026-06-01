@@ -47,6 +47,32 @@ PA_FORMAT = pyaudio.paInt16
 WAKE_PHRASES = [p.lower().strip() for p in APP_CONFIG.wake_phrases]
 WAKE_FUZZ_THRESHOLD = APP_CONFIG.wake_fuzz_threshold
 
+# Individual tokens that make up any wake phrase ("oye", "oiga", "ghost", "gost"…).
+# Used to scrub leftover wake fragments from the cleaned command — Whisper
+# mis-transcribes the wake phrase often enough ("a oiga ghost", "ghost ghost")
+# that a literal phrase-removal leaves junk like "a", "ghost", "a ghost".
+_WAKE_WORD_SET = {w for wp in WAKE_PHRASES for w in wp.split()}
+# Pure interjection noise that precedes a wake word but is never the start of a
+# real command. Deliberately excludes content words like "que", "el", "la",
+# "de" — those belong to legitimate prompts ("qué hora es", "el clima").
+_WAKE_FILLER_WORDS = {"a", "ah", "eh", "e", "mm", "mmm", "em", "este", "pues"}
+_WAKE_RESIDUAL_RATIO = 80  # fuzz ratio to treat a word as a wake fragment
+
+
+def _is_wake_residual_word(word: str) -> bool:
+    """True if `word` is a wake-phrase fragment or trivial filler."""
+    if word in _WAKE_FILLER_WORDS:
+        return True
+    return max((fuzz.ratio(word, ww) for ww in _WAKE_WORD_SET), default=0) >= _WAKE_RESIDUAL_RATIO
+
+
+def reload_wake_phrases() -> None:
+    """Refresh wake globals from APP_CONFIG (after the calibrator edits them)."""
+    global WAKE_PHRASES, WAKE_FUZZ_THRESHOLD, _WAKE_WORD_SET
+    WAKE_PHRASES = [p.lower().strip() for p in APP_CONFIG.wake_phrases if p.strip()]
+    WAKE_FUZZ_THRESHOLD = APP_CONFIG.wake_fuzz_threshold
+    _WAKE_WORD_SET = {w for wp in WAKE_PHRASES for w in wp.split()}
+
 # Filters for STT post-processing — module-level so the regex compiles once
 _JUNK_RE = re.compile(r"^(m+h*|e+h*|a+h*|u+h*|o+h*|s+h+)$")
 _CLEAN_RE = re.compile(
@@ -182,8 +208,22 @@ def _check_wake(text: str) -> tuple[bool, str]:
             logger.debug("Wake check: score=%d/%d (%s) in %r", best_score, best_threshold, best_wp, text_lower)
 
     if best_score >= best_threshold:
+        # Remove the literal wake phrase first…
         pattern = re.escape(best_wp)
         clean = re.sub(rf"\b{pattern}\b", "", text_lower).strip(" ,.;:-")
+        # …then scrub any leftover wake fragments / fillers from the FRONT.
+        # Whisper routinely mangles the wake phrase ("a oiga ghost", "ghost
+        # ghost"), so a literal removal alone leaves junk that would be sent
+        # as the command. Trimming only the front preserves real commands that
+        # legitimately contain a ghost-like word later on.
+        residual = clean.split()
+        while residual and _is_wake_residual_word(residual[0]):
+            residual.pop(0)
+        clean = " ".join(residual).strip(" ,.;:-")
+        # If nothing meaningful remains, return empty so the caller goes to
+        # LISTENING and waits for the user's command instead of firing one.
+        if len(clean) < 3:
+            clean = ""
         return True, clean
 
     return False, text_lower
@@ -244,6 +284,12 @@ class AudioEngine(QObject):
         self._stt_thread: Optional[threading.Thread] = None
         self._stt_queue: queue.Queue = queue.Queue(maxsize=8)
         self._accept_input = True
+        # True while capturing the user's prompt (post-wake). When on, Whisper
+        # is forced to Spanish (much more accurate on short clips, the user's
+        # actual command is being said) and the lang whitelist + no_speech
+        # filter are loosened — otherwise the post-wake clip is routinely
+        # dropped as lang=en/cs/de or no_speech_prob>0.6 on the TUF's fan.
+        self._listen_mode = False
         self._speech_frames = 0
 
         # TTS engines (lazy-init so pyttsx3 doesn't block the UI thread on startup)
@@ -414,6 +460,9 @@ class AudioEngine(QObject):
 
     def resume_input(self):
         self._accept_input = True
+
+    def set_listen_mode(self, on: bool) -> None:
+        self._listen_mode = bool(on)
 
     def _update_auto_gain(self, vol: float):
         """Adjust input gain dynamically to keep volume near target level."""
@@ -626,7 +675,7 @@ class AudioEngine(QObject):
                 without_timestamps=True,
                 vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=300),
-                language=None,
+                language="es" if self._listen_mode else None,
             )
             segments_list = list(segments)
             text = " ".join(s.text for s in segments_list).strip().lower()
@@ -649,7 +698,10 @@ class AudioEngine(QObject):
         # Reject anything that isn't Spanish or English.
         # For short utterances we only block the language itself, not the probability,
         # because Whisper is inherently unsure about 1-2 word clips.
-        if info is not None:
+        # In listen_mode (post-wake command capture) we skip this entirely:
+        # language is forced to "es" upstream and we trust the audio is the
+        # user's command, so a noisy lang_tag must not drop the text.
+        if info is not None and not self._listen_mode:
             if lang_tag not in ("es", "en"):
                 if not APP_CONFIG.privacy_mode:
                     logger.info(
@@ -691,7 +743,12 @@ class AudioEngine(QObject):
                         )
                         logger.debug("  filtered text: %s", text[:50])
                     return
-                if no_speech_prob > 0.6:
+                # In listen_mode the user is definitely the source; raise the
+                # no_speech threshold so fan noise + auto-gain dips don't tank
+                # legitimate commands. Outside listen_mode keep 0.6 to filter
+                # ambient false-positives.
+                ns_threshold = 0.92 if self._listen_mode else 0.6
+                if no_speech_prob > ns_threshold:
                     if not APP_CONFIG.privacy_mode:
                         logger.info(
                             "STT filtered (no speech): no_speech_prob=%.2f | lang=%s | len=%d",

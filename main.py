@@ -98,6 +98,10 @@ class GhostJarvisApp(QMainWindow):
 
         # Ghost bridge
         self.ghost = GhostBridge()
+        # Read-aloud monitor: queue of texts from other sessions (webchat) to
+        # speak when idle. All access happens on the GUI thread.
+        self._foreign_queue: list[str] = []
+        self.ghost.foreign_response.connect(self._on_foreign_response)
 
         # Voice log window
         self._log_handler = QtLogHandler()
@@ -142,6 +146,14 @@ class GhostJarvisApp(QMainWindow):
         self.sm.transition(State.STANDBY)
         QTimer.singleShot(0, self._check_standby)
 
+        # Read-aloud monitor: subscribe to the webchat session and speak its
+        # replies aloud. Never monitor our own session (would double-read).
+        if APP_CONFIG.read_all_responses:
+            mon = (APP_CONFIG.monitor_session or "").strip()
+            own_tail = APP_CONFIG.session_key.split(":")[-1] if APP_CONFIG.session_key else ""
+            if mon and mon != own_tail and mon != APP_CONFIG.session_key:
+                self.ghost.start_monitor([mon])
+
     def _preload_whisper(self):
         import threading
         threading.Thread(target=self._do_preload_whisper, daemon=True, name="whisper-preload").start()
@@ -159,6 +171,7 @@ class GhostJarvisApp(QMainWindow):
             self.visual.set_state("STANDBY", "Stand-by")
             self.audio.play_sound("listen_off")
             self.audio.resume_input()
+            self.audio.set_listen_mode(False)
             if APP_CONFIG.duck_volume_enabled:
                 restore_volume()
 
@@ -167,8 +180,11 @@ class GhostJarvisApp(QMainWindow):
             self.visual.set_state("IDLE", "En espera")
             self.audio.play_sound("listen_off")
             self.audio.resume_input()
+            self.audio.set_listen_mode(False)
             if APP_CONFIG.duck_volume_enabled:
                 restore_volume()
+            # If a webchat reply is queued, read it now that we're free.
+            QTimer.singleShot(300, self._flush_foreign_queue)
 
         @self.sm.on_enter(State.WAKE)
         def _(ctx):
@@ -203,6 +219,7 @@ class GhostJarvisApp(QMainWindow):
             self.visual.set_state("LISTENING", "Escuchando...")
             self.audio.play_sound("ready")
             self.audio.resume_input()
+            self.audio.set_listen_mode(True)
             self._listen_timeout = 0
             self._listen_timer = QTimer(self)
             self._listen_timer.timeout.connect(self._on_listen_tick)
@@ -218,6 +235,7 @@ class GhostJarvisApp(QMainWindow):
         def _(ctx):
             self.visual.set_state("PROCESSING", "Pensando...")
             self.audio.pause_input()
+            self.audio.set_listen_mode(False)
             if self._listen_timer and self._listen_timer.isActive():
                 self._listen_timer.stop()
             prompt = ctx.user_prompt
@@ -468,7 +486,9 @@ class GhostJarvisApp(QMainWindow):
     def _on_listen_tick(self):
         self._listen_timeout += 1
         self._last_activity = 0
-        if self._listen_timeout >= 10:
+        # 18s is enough room for the user to think and answer a question after
+        # SPEAKING ends; 10s was tripping users who pause before responding.
+        if self._listen_timeout >= 18:
             self._listen_timer.stop()
             self.sm.transition(State.IDLE)
 
@@ -480,10 +500,41 @@ class GhostJarvisApp(QMainWindow):
         self._last_activity = 0
         self.sm.transition(State.SPEAKING)
 
+    @pyqtSlot(str)
+    def _on_foreign_response(self, text: str):
+        """A monitored session (the webchat) produced a reply. Queue it and try
+        to read it; never interrupt the user's own voice turn."""
+        if not text or not text.strip():
+            return
+        self._foreign_queue.append(text.strip())
+        if not APP_CONFIG.privacy_mode:
+            logging.getLogger("ghost").info("Webchat reply queued for read-aloud (%d chars)", len(text))
+        self._flush_foreign_queue()
+
+    def _flush_foreign_queue(self):
+        """Speak the next queued webchat reply if we're idle and not talking."""
+        if not self._foreign_queue:
+            return
+        if self.sm.state not in (State.IDLE, State.STANDBY):
+            return
+        if self.audio.is_speaking():
+            return
+        text = self._foreign_queue.pop(0)
+        self.sm.context.ghost_response = text
+        # Webchat conversation lives in text; don't open a voice LISTENING turn.
+        self.sm.context.session_active = False
+        self._last_activity = 0
+        self.sm.transition(State.SPEAKING)
+
     def _on_ghost_error(self, error: str):
         logging.getLogger("ghost").error("Ghost error: %s", error)
         # If the agent is unreachable, switch to STANDBY instead of speaking the raw error
-        if "no encontrado" in error.lower() or "config" in error.lower() or "timeout" in error.lower() or "no respondió" in error.lower():
+        err_lower = error.lower()
+        unreachable_tokens = (
+            "no encontrado", "config", "timeout",
+            "no respondió", "connection lost", "closed by server",
+        )
+        if any(tok in err_lower for tok in unreachable_tokens):
             self.sm.transition(State.STANDBY)
             self._standby_timer.start(30000)
             return

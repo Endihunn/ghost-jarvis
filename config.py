@@ -102,6 +102,10 @@ class Config:
     wireframe_enabled: bool = True
     glitch_enabled: bool = True
 
+    # Read-aloud monitor: speak replies from other sessions (the webchat) too.
+    read_all_responses: bool = True
+    monitor_session: str = "main"
+
     # Privacy
     privacy_mode: bool = False
 

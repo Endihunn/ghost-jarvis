@@ -25,7 +25,7 @@ import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, QObject, pyqtSignal
 
 from config import APP_CONFIG
 
@@ -168,14 +168,30 @@ def _ws_send_text(sock: socket.socket, text: str, lock: threading.Lock) -> None:
         sock.sendall(header + mask + masked)
 
 
-def _ws_pong(sock: socket.socket, payload: bytes, lock: threading.Lock) -> None:
+def _ws_send_masked_control(sock: socket.socket, opcode: int, payload: bytes,
+                             lock: threading.Lock) -> None:
+    """Send a client-to-server control frame with the mandatory MASK bit set.
+
+    RFC 6455 §5.1: every frame the client sends MUST be masked, including
+    control frames (ping/pong). Sending unmasked frames triggers a server-
+    side protocol error ("Invalid WebSocket frame: MASK must be set") and
+    the gateway closes the connection, killing whatever run was in flight.
+    Control payloads must be ≤125 bytes per spec.
+    """
+    length = len(payload)
+    mask = os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    header = bytes([0x80 | (opcode & 0x0F), 0x80 | length])
     with lock:
-        sock.sendall(bytes([0x8A, len(payload)]) + payload)
+        sock.sendall(header + mask + masked)
+
+
+def _ws_pong(sock: socket.socket, payload: bytes, lock: threading.Lock) -> None:
+    _ws_send_masked_control(sock, 0x0A, payload, lock)
 
 
 def _ws_ping(sock: socket.socket, payload: bytes, lock: threading.Lock) -> None:
-    with lock:
-        sock.sendall(bytes([0x89, len(payload)]) + payload)
+    _ws_send_masked_control(sock, 0x09, payload, lock)
 
 
 # ---------------------------------------------------------------------------
@@ -205,10 +221,56 @@ class GatewayWS:
         self._pending: dict[str, dict] = {}
         self._pending_lock = threading.Lock()
 
+        # Monitor mode: qualified session keys we passively read aloud (e.g.
+        # "agent:main:main" for the webchat). Their chat finals are delivered
+        # to _on_foreign_final instead of a pending request.
+        self._monitor_sessions: set[str] = set()
+        self._on_foreign_final: Optional[Callable[[str, str], None]] = None
+        # Accumulators for monitored sessions' streaming text (cumulative).
+        self._foreign_buffers: dict[str, dict] = {}
+
+    def set_monitor(self, sessions: list[str],
+                    on_foreign_final: Optional[Callable[[str, str], None]]) -> None:
+        """Configure passive read-aloud of other sessions' chat finals.
+
+        `sessions` are raw keys (e.g. ["main"]); they're qualified to
+        "agent:<id>:<key>" to match the form the gateway echoes. Call before
+        connect() (or reconnect) so the subscriptions are sent on handshake.
+        """
+        self._monitor_sessions = {_qualified_session_key(s) for s in sessions if s}
+        self._on_foreign_final = on_foreign_final
+
+    def _subscribe_monitored(self) -> None:
+        """Send chat.subscribe for each monitored session over the live sock."""
+        sock = self._sock
+        if not sock:
+            return
+        for sk in self._monitor_sessions:
+            # Subscribe by the qualified key; the gateway parses the session
+            # out of it and registers this node as a subscriber.
+            try:
+                _ws_send_text(sock, json.dumps({
+                    "type": "req", "id": str(uuid.uuid4()),
+                    "method": "chat.subscribe",
+                    "params": {"sessionKey": sk},
+                }), self._send_lock)
+                logger.info("Subscribed to session for read-aloud: %s", sk)
+            except Exception as e:
+                logger.warning("chat.subscribe failed for %s: %s", sk, e)
+
     def connect(self, timeout: float = 30.0) -> bool:
         with self._state_lock:
             if self._connected:
                 return True
+            # Defense-in-depth: if a previous socket was left dangling because
+            # close() wasn't called between failures, drop it now so the
+            # gateway doesn't see two FDs from the same client.
+            stale, self._sock = self._sock, None
+        if stale:
+            try:
+                stale.close()
+            except Exception:
+                pass
 
         url = APP_CONFIG.gateway_url
         from urllib.parse import urlparse
@@ -325,6 +387,9 @@ class GatewayWS:
             )
             self._ping_thread.start()
             logger.info("Gateway WS connected (protocol 4) to %s:%s", host, port)
+            # Re-arm read-aloud subscriptions on every (re)connect.
+            if self._monitor_sessions:
+                self._subscribe_monitored()
             return True
 
         except Exception as e:
@@ -348,7 +413,7 @@ class GatewayWS:
         message: str,
         agent_id: str = "main",
         session_key: str = "",
-        timeout: float = 240.0,
+        timeout: float = 600.0,
     ) -> str:
         if not self._connected:
             raise ConnectionError("Not connected to gateway")
@@ -418,8 +483,12 @@ class GatewayWS:
                 entry["event"].set()
 
     def _ping_loop(self) -> None:
+        # 10s instead of 30s so the gateway sees client activity while the
+        # agent is still "thinking" — the server's idle-cutter closes
+        # otherwise-quiet sockets around the 25s mark, which would tank
+        # long-running chat runs that legitimately take minutes.
         while self._running:
-            time.sleep(30.0)
+            time.sleep(10.0)
             with self._state_lock:
                 sock = self._sock
                 if not sock or not self._connected:
@@ -494,6 +563,11 @@ class GatewayWS:
                         entry = self._pending.get(sk)
 
                     if not entry:
+                        # Not one of our own requests. If it's a session we
+                        # passively monitor (e.g. the webchat), accumulate its
+                        # text and deliver the final to the read-aloud callback.
+                        if sk in self._monitor_sessions:
+                            self._handle_foreign_event(sk, state, message_data)
                         continue
 
                     # Accumulate text from delta/final
@@ -524,6 +598,16 @@ class GatewayWS:
             with self._state_lock:
                 self._connected = False
                 self._running = False
+                # Close the socket on our side too. Without this the OS keeps
+                # the FD half-open until GC, and the gateway sees a zombie
+                # ESTABLISHED conn from the same client — the next connect()
+                # may be rejected with "WebSocket closed by server" mid-handshake.
+                sock, self._sock = self._sock, None
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
             with self._pending_lock:
                 for entry in self._pending.values():
                     if entry["ok"] is None:
@@ -531,6 +615,32 @@ class GatewayWS:
                         entry["error"] = "Gateway connection lost"
                         entry["event"].set()
             logger.warning("Gateway WS recv loop exited")
+
+    def _handle_foreign_event(self, sk: str, state: str, message_data: dict) -> None:
+        """Accumulate a monitored session's streaming text and fire the
+        read-aloud callback on `final`. The gateway sends cumulative text, so
+        we just keep the latest full text and emit it once when complete.
+        """
+        buf = self._foreign_buffers.get(sk)
+        if buf is None:
+            buf = {"text": ""}
+            self._foreign_buffers[sk] = buf
+
+        if state in ("delta", "final") and message_data:
+            for block in message_data.get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    full_text = block.get("text", "")
+                    if len(full_text) >= len(buf["text"]):
+                        buf["text"] = full_text
+
+        if state in ("final", "aborted", "error"):
+            text = buf.get("text", "").strip()
+            self._foreign_buffers.pop(sk, None)
+            if state == "final" and text and self._on_foreign_final:
+                try:
+                    self._on_foreign_final(text, sk)
+                except Exception as e:
+                    logger.error("foreign-final callback error: %s", e)
 
     def close(self) -> None:
         with self._state_lock:
@@ -590,7 +700,7 @@ class GhostWorker(QThread):
                 prompt,
                 agent_id="main",
                 session_key=APP_CONFIG.session_key,
-                timeout=240.0,
+                timeout=600.0,
             )
         except CancelledError:
             logger.info("Ghost request cancelled")
@@ -646,12 +756,55 @@ class StandbyChecker(QThread):
 # GhostBridge — public interface used by the main window
 # ---------------------------------------------------------------------------
 
-class GhostBridge:
+class GhostBridge(QObject):
+    # Emitted (from the recv thread, delivered queued to the GUI thread) when a
+    # monitored session — e.g. the webchat 'main' — produces a final reply that
+    # should be read aloud.
+    foreign_response = pyqtSignal(str)
+
     def __init__(self):
+        super().__init__()
         self._current_worker: Optional[GhostWorker] = None
+        self._monitor_running = False
+        self._monitor_thread: Optional[threading.Thread] = None
 
     def is_available(self) -> bool:
         return _http_is_alive(timeout=3.0)
+
+    # ── Read-aloud monitor ────────────────────────────────────────────────
+    def start_monitor(self, sessions: list[str]) -> None:
+        """Keep a persistent gateway connection subscribed to `sessions` and
+        emit foreign_response for each final reply, so the app can read other
+        sessions (the webchat) aloud. Idempotent.
+        """
+        if self._monitor_running:
+            return
+        self._monitor_running = True
+        _gateway.set_monitor(sessions, self._on_foreign_final)
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_supervisor, daemon=True, name="gw-monitor"
+        )
+        self._monitor_thread.start()
+        logger.info("Read-aloud monitor started for sessions: %s", sessions)
+
+    def _on_foreign_final(self, text: str, session_key: str) -> None:
+        # Called from the recv thread; pyqtSignal hops to the GUI thread.
+        self.foreign_response.emit(text)
+
+    def _monitor_supervisor(self) -> None:
+        """Maintain the gateway connection so monitored subscriptions stay live.
+        Reconnects with backoff; connect() re-arms the subscriptions.
+        """
+        backoff = 3.0
+        while self._monitor_running:
+            if not _gateway.is_connected():
+                if _gateway.connect(timeout=30.0):
+                    backoff = 3.0
+                else:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 1.5, 30.0)
+                    continue
+            time.sleep(3.0)
 
     def send(self, prompt: str, on_response: Callable, on_error: Callable) -> None:
         if self._current_worker and self._current_worker.isRunning():
@@ -679,6 +832,7 @@ class GhostBridge:
 
     def close(self) -> None:
         global _gateway
+        self._monitor_running = False
         _gateway.close()
 
     def _cleanup_worker(self, worker: GhostWorker) -> None:
