@@ -557,6 +557,7 @@ class GatewayWS:
                     ep = msg.get("payload") or {}
                     sk = ep.get("sessionKey", "")
                     state = ep.get("state", "")
+                    run_id = ep.get("runId", "")
                     message_data = ep.get("message") or {}
 
                     with self._pending_lock:
@@ -567,7 +568,7 @@ class GatewayWS:
                         # passively monitor (e.g. the webchat), accumulate its
                         # text and deliver the final to the read-aloud callback.
                         if sk in self._monitor_sessions:
-                            self._handle_foreign_event(sk, state, message_data)
+                            self._handle_foreign_event(sk, run_id, state, message_data)
                         continue
 
                     # Accumulate text from delta/final
@@ -614,17 +615,28 @@ class GatewayWS:
                         entry["ok"] = False
                         entry["error"] = "Gateway connection lost"
                         entry["event"].set()
+            # Drop any half-streamed monitor buffers; their runs died with the
+            # socket and would otherwise poison the next run keyed the same way.
+            self._foreign_buffers.clear()
             logger.warning("Gateway WS recv loop exited")
 
-    def _handle_foreign_event(self, sk: str, state: str, message_data: dict) -> None:
+    def _handle_foreign_event(self, sk: str, run_id: str, state: str,
+                              message_data: dict) -> None:
         """Accumulate a monitored session's streaming text and fire the
-        read-aloud callback on `final`. The gateway sends cumulative text, so
-        we just keep the latest full text and emit it once when complete.
+        read-aloud callback on `final`.
+
+        Buffers are keyed by runId, NOT by sessionKey: the webchat can produce
+        several runs on the same session (e.g. two messages stacked after a
+        gateway restart), and they may stream interleaved. Keying by session
+        let one run's cumulative text clobber the other under the >= guard, so
+        a run's final could deliver the wrong/empty text and one reply was
+        lost. Per-run buffers keep them independent.
         """
-        buf = self._foreign_buffers.get(sk)
+        key = run_id or sk
+        buf = self._foreign_buffers.get(key)
         if buf is None:
-            buf = {"text": ""}
-            self._foreign_buffers[sk] = buf
+            buf = {"text": "", "sk": sk}
+            self._foreign_buffers[key] = buf
 
         if state in ("delta", "final") and message_data:
             for block in message_data.get("content") or []:
@@ -635,7 +647,7 @@ class GatewayWS:
 
         if state in ("final", "aborted", "error"):
             text = buf.get("text", "").strip()
-            self._foreign_buffers.pop(sk, None)
+            self._foreign_buffers.pop(key, None)
             if state == "final" and text and self._on_foreign_final:
                 try:
                     self._on_foreign_final(text, sk)
