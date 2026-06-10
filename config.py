@@ -81,6 +81,19 @@ class Config:
     tts_rate: str = "+5%"
     tts_local_rate: int = 185
 
+    # Conversación fluida (v1.1)
+    # streaming_tts: hablar oración por oración conforme el agente streamea,
+    # en vez de esperar la respuesta completa. Kill-switch por si acaso.
+    streaming_tts: bool = True
+    # barge_in: mantener el micrófono abierto durante SPEAKING/PROCESSING para
+    # poder interrumpir ("ghost cállate") o cancelar el run con la wake word.
+    barge_in_enabled: bool = True
+    # Comandos locales post-wake que no viajan al agente: "repite", "más alto"…
+    local_commands_enabled: bool = True
+    # Días que viven los audios cacheados de respuestas (las wake responses
+    # pre-generadas se conservan siempre).
+    tts_cache_max_days: int = 14
+
     # Voz Jarvis
     jarvis_voice_effects: bool = True
     jarvis_reverb: float = 0.15

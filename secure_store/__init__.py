@@ -8,8 +8,9 @@ Delegates to the best available backend per platform:
 import sys
 
 if sys.platform == "win32":
-    from .windows import encrypt, decrypt, is_encrypted
+    from .windows import encrypt, decrypt, is_encrypted, _DPAPI_OK
 else:
     from .unix import encrypt, decrypt, is_encrypted
+    _DPAPI_OK = False
 
-__all__ = ["encrypt", "decrypt", "is_encrypted"]
+__all__ = ["encrypt", "decrypt", "is_encrypted", "_DPAPI_OK"]

@@ -4,6 +4,10 @@ Asistente de escritorio tipo **J.A.R.V.I.S.** conectado al agente **main** de Op
 
 ## Características
 
+- **Respuesta en streaming (v1.1)**: habla la primera oración ~2 s después de que el agente empieza a contestar — sintetiza la siguiente oración mientras suena la actual, en vez de esperar la respuesta completa
+- **Barge-in (v1.1)**: el micrófono sigue abierto mientras Ghost habla o piensa — "ghost, cállate" corta la voz en seco y la wake word cancela un run en curso (con echo-guard para no oírse a sí mismo)
+- **Comandos locales (v1.1)**: "repite", "más alto/más bajo", "cancela" se resuelven al instante sin viajar al agente
+- **Markdown → habla (v1.1)**: las respuestas se limpian antes del TTS (sin asteriscos, fences, URLs crudas ni emojis)
 - **Wake words**: "oye, ghost", "jarvis", "endiku" y más — detección con fuzzy matching
 - **STT**: `faster-whisper` small con **GPU CUDA** (float16) para mejor precisión y baja latencia
 - **VAD adaptativo**: Auto-gain, timeouts configurables, buffer previo ajustable

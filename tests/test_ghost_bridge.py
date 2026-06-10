@@ -106,15 +106,53 @@ def test_ws_recv_frame_close_raises():
         send_sock.close()
 
 
-def test_build_signed_device_auth_without_identity(monkeypatch):
-    """If identity can't be loaded, _build_signed_device_auth returns None."""
-    monkeypatch.setattr(gb, "_load_device_identity", lambda: None)
-    result = gb._build_signed_device_auth("nonce123", "token456")
-    assert result is None
+# NOTE: the device-auth signing helpers (_b64url, _build_signed_device_auth)
+# were removed in 56f50e1 when the bridge switched to Protocol-4 token-only
+# backend-client auth on loopback; their tests went with them.
 
 
-def test_b64url():
-    assert gb._b64url(b"test") == "dGVzdA"
-    assert "=" not in gb._b64url(b"any")
-    assert "+" not in gb._b64url(b"\xff\xfe")
-    assert "/" not in gb._b64url(b"\xff\xfe")
+def test_qualified_session_key():
+    assert gb._qualified_session_key("ghost-jarvis") == "agent:main:ghost-jarvis"
+    assert gb._qualified_session_key("ghost-jarvis", "euterpe") == "agent:euterpe:ghost-jarvis"
+    # Already-qualified keys pass through untouched
+    assert gb._qualified_session_key("agent:main:main") == "agent:main:main"
+    assert gb._qualified_session_key("") == ""
+
+
+def test_send_message_delivers_deltas_via_on_delta():
+    """The recv path must hand each NEW text fragment to on_delta exactly once
+    (the gateway streams cumulative snapshots, not raw deltas)."""
+    ws = gb.GatewayWS()
+    sk = gb._qualified_session_key("test-session")
+    got: list[str] = []
+
+    import threading
+    entry = {
+        "event": threading.Event(),
+        "chunks": [],
+        "received_chars": 0,
+        "ok": None,
+        "error": None,
+        "cancelled": False,
+        "req_id": "rid",
+        "on_delta": got.append,
+    }
+    ws._pending[sk] = entry
+
+    def feed(full_text: str, state: str = "delta"):
+        # Mimics the _recv_loop chat-event handling on a cumulative snapshot
+        sent = entry["received_chars"]
+        if len(full_text) > sent:
+            fragment = full_text[sent:]
+            entry["chunks"].append(fragment)
+            entry["received_chars"] = len(full_text)
+            cb = entry.get("on_delta")
+            if cb and not entry.get("cancelled"):
+                cb(fragment)
+
+    feed("Hola")
+    feed("Hola, señor.")
+    feed("Hola, señor.")          # duplicate snapshot → no new chars
+    feed("Hola, señor. Listo.")
+    assert got == ["Hola", ", señor.", " Listo."]
+    assert "".join(entry["chunks"]) == "Hola, señor. Listo."

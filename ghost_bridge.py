@@ -211,6 +211,10 @@ class GatewayWS:
         self._sock: Optional[socket.socket] = None
         self._send_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        # Serializes the whole handshake: the monitor supervisor and a
+        # GhostWorker can both decide to reconnect at the same time; without
+        # this, two sockets get created and one recv loop clobbers the other.
+        self._connect_lock = threading.Lock()
         self._connected = False
         self._running = False
         self._recv_thread: Optional[threading.Thread] = None
@@ -259,6 +263,10 @@ class GatewayWS:
                 logger.warning("chat.subscribe failed for %s: %s", sk, e)
 
     def connect(self, timeout: float = 30.0) -> bool:
+        with self._connect_lock:
+            return self._connect_locked(timeout)
+
+    def _connect_locked(self, timeout: float) -> bool:
         with self._state_lock:
             if self._connected:
                 return True
@@ -414,7 +422,15 @@ class GatewayWS:
         agent_id: str = "main",
         session_key: str = "",
         timeout: float = 600.0,
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> str:
+        """Send a chat message and wait for the final reply.
+
+        `on_delta`, when given, is invoked from the recv thread with each NEW
+        text fragment as the agent streams (the gateway sends cumulative
+        snapshots; only the unseen suffix is delivered). Exceptions from the
+        callback are swallowed so they can't kill the recv loop.
+        """
         if not self._connected:
             raise ConnectionError("Not connected to gateway")
 
@@ -434,6 +450,7 @@ class GatewayWS:
             "error": None,
             "cancelled": False,
             "req_id": req_id,   # match the chat.send res (ok/err)
+            "on_delta": on_delta,
         }
 
         with self._pending_lock:
@@ -580,8 +597,15 @@ class GatewayWS:
                                 # Deliver only new characters (server sends cumulative text)
                                 sent = entry["received_chars"]
                                 if len(full_text) > sent:
-                                    entry["chunks"].append(full_text[sent:])
+                                    fragment = full_text[sent:]
+                                    entry["chunks"].append(fragment)
                                     entry["received_chars"] = len(full_text)
+                                    cb = entry.get("on_delta")
+                                    if cb and not entry.get("cancelled"):
+                                        try:
+                                            cb(fragment)
+                                        except Exception as e:
+                                            logger.error("on_delta callback error: %s", e)
 
                     if state == "final":
                         entry["ok"] = True
@@ -679,7 +703,19 @@ _gateway = GatewayWS()
 # ---------------------------------------------------------------------------
 
 class GhostWorker(QThread):
-    response_ready = pyqtSignal(str, bool)
+    """Sends one prompt and streams the reply.
+
+    Signals (all delivered queued onto the GUI thread):
+      sentence_ready(str)      — a complete, speech-sanitized sentence arrived.
+                                 Emitted as the agent streams, so TTS can start
+                                 speaking long before the run finishes.
+      stream_done(str, bool)   — full sanitized text + is_question. Always
+                                 emitted on success, even if no sentences were
+                                 (streaming disabled or empty reply).
+      error_occurred(str)      — terminal failure; no stream_done follows.
+    """
+    sentence_ready = pyqtSignal(str)
+    stream_done = pyqtSignal(str, bool)
     error_occurred = pyqtSignal(str)
 
     def __init__(self, prompt: str, parent=None):
@@ -692,6 +728,7 @@ class GhostWorker(QThread):
 
     def run(self) -> None:
         global _gateway
+        from tts_text import SentenceStream, sanitize_for_speech
 
         if not _gateway.is_connected():
             logger.info("GhostWorker: gateway not connected, attempting reconnect...")
@@ -704,8 +741,26 @@ class GhostWorker(QThread):
 
         prompt = APP_CONFIG.ghost_prompt_prefix + self.prompt
         start = time.time()
+        first_sentence_at: list[float] = []
         if not APP_CONFIG.privacy_mode:
             logger.info("Sending to Ghost: %s...", prompt[:80])
+
+        splitter = SentenceStream()
+
+        def _emit_sentences(sentences: list[str]) -> None:
+            for s in sentences:
+                clean = sanitize_for_speech(s)
+                if clean and not self._cancelled:
+                    if not first_sentence_at:
+                        first_sentence_at.append(time.time() - start)
+                    self.sentence_ready.emit(clean)
+
+        def _on_delta(fragment: str) -> None:
+            # Runs on the gateway recv thread; signal emission is queued so the
+            # GUI thread does the actual TTS work.
+            if self._cancelled or not APP_CONFIG.streaming_tts:
+                return
+            _emit_sentences(splitter.feed(fragment))
 
         try:
             text = _gateway.send_message(
@@ -713,6 +768,7 @@ class GhostWorker(QThread):
                 agent_id="main",
                 session_key=APP_CONFIG.session_key,
                 timeout=600.0,
+                on_delta=_on_delta,
             )
         except CancelledError:
             logger.info("Ghost request cancelled")
@@ -735,14 +791,22 @@ class GhostWorker(QThread):
         if self._cancelled:
             return
 
+        # Tail of the stream that never hit a sentence boundary.
+        if APP_CONFIG.streaming_tts:
+            _emit_sentences(splitter.flush())
+
         elapsed = time.time() - start
         if not text:
             text = "Ghost no respondió nada."
 
         question = is_question(text)
         if not APP_CONFIG.privacy_mode:
-            logger.info("Ghost responded in %.1fs (%d chars, question=%s)", elapsed, len(text), question)
-        self.response_ready.emit(text, question)
+            ttfs = f", first-sentence={first_sentence_at[0]:.1f}s" if first_sentence_at else ""
+            logger.info(
+                "Ghost responded in %.1fs (%d chars, question=%s%s)",
+                elapsed, len(text), question, ttfs,
+            )
+        self.stream_done.emit(sanitize_for_speech(text) or text, question)
 
 
 # ---------------------------------------------------------------------------
@@ -783,6 +847,10 @@ class GhostBridge(QObject):
     def is_available(self) -> bool:
         return _http_is_alive(timeout=3.0)
 
+    def is_busy(self) -> bool:
+        """True while a prompt is in flight (worker thread running)."""
+        return bool(self._current_worker and self._current_worker.isRunning())
+
     # ── Read-aloud monitor ────────────────────────────────────────────────
     def start_monitor(self, sessions: list[str]) -> None:
         """Keep a persistent gateway connection subscribed to `sessions` and
@@ -818,14 +886,24 @@ class GhostBridge(QObject):
                     continue
             time.sleep(3.0)
 
-    def send(self, prompt: str, on_response: Callable, on_error: Callable) -> None:
+    def send(
+        self,
+        prompt: str,
+        on_response: Callable,
+        on_error: Callable,
+        on_sentence: Optional[Callable] = None,
+    ) -> None:
+        """Send a prompt. `on_response(full_text, is_question)` fires once at
+        the end; `on_sentence(text)` fires per streamed sentence (if given)."""
         if self._current_worker and self._current_worker.isRunning():
             self._current_worker.cancel()
             _gateway.cancel(_qualified_session_key(APP_CONFIG.session_key))
             self._current_worker.wait(2000)
 
         worker = GhostWorker(prompt)
-        worker.response_ready.connect(on_response)
+        if on_sentence is not None:
+            worker.sentence_ready.connect(on_sentence)
+        worker.stream_done.connect(on_response)
         worker.error_occurred.connect(on_error)
         worker.finished.connect(lambda: self._cleanup_worker(worker))
         self._current_worker = worker

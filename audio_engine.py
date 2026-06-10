@@ -33,6 +33,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from config import APP_CONFIG
 from gpu_utils import get_optimal_whisper_config
 from voice_effects import process_audio_jarvis, jarvis_effect_hash
+from tts_text import SentenceStream, sanitize_for_speech
 
 logger = logging.getLogger("audio")
 
@@ -324,6 +325,27 @@ class AudioEngine(QObject):
         self._spectrum = [0.0] * 8
         self._spectrum_skip = 0
 
+        # --- Streaming speech pipeline (v1.1) ---
+        # Sentences flow text → synth queue → play queue, so sentence N+1 is
+        # synthesized while N is playing. A generation counter cancels
+        # everything in flight atomically: stop_speaking() bumps the gen and
+        # both workers drop stale items, which also kills the old "phantom
+        # audio" bug where a synthesis finishing after stop() played anyway.
+        self._speech_lock = threading.Lock()
+        self._speech_gen = 0
+        self._stream_closed = True
+        self._items_pending = 0
+        self._synth_q: queue.Queue = queue.Queue()
+        self._play_q: queue.Queue = queue.Queue()
+        self._synth_thread: Optional[threading.Thread] = None
+        self._play_thread: Optional[threading.Thread] = None
+        # What the TTS is saying right now (current sentence) — used by the
+        # barge-in echo-guard to discard mic transcriptions of our own voice.
+        self._now_playing = ""
+        self._last_played = ""
+        # User-adjustable voice volume ("más alto"/"más bajo"), applied per Sound.
+        self._voice_volume = 1.0
+
     def _ensure_sounds(self):
         snd_dir = Path(__file__).with_name("assets") / "sounds"
         snd_dir.mkdir(parents=True, exist_ok=True)
@@ -427,10 +449,27 @@ class AudioEngine(QObject):
         self._thread.start()
         self._stt_thread = threading.Thread(target=self._stt_loop, daemon=True)
         self._stt_thread.start()
+        self._synth_thread = threading.Thread(
+            target=self._synth_worker, daemon=True, name="tts-synth"
+        )
+        self._synth_thread.start()
+        self._play_thread = threading.Thread(
+            target=self._play_worker, daemon=True, name="tts-play"
+        )
+        self._play_thread.start()
+        threading.Thread(
+            target=self._cleanup_tts_cache, daemon=True, name="tts-cache-gc"
+        ).start()
 
     def stop(self):
         self._running = False
         self._accept_input = False
+        self.stop_speaking()
+        for q in (self._synth_q, self._play_q):
+            try:
+                q.put(None, block=False)
+            except queue.Full:
+                pass
         try:
             self._stt_queue.put(None, block=False)
         except queue.Full:
@@ -980,93 +1019,246 @@ class AudioEngine(QObject):
                 self._generate_wake_cache(t)
         threading.Thread(target=_run, daemon=True, name="tts-prewarm").start()
 
-    def speak_agent(self, text: str, blocking: bool = False):
-        if not APP_CONFIG.tts_use_edge:
-            self.speak_local(text, blocking=blocking)
-            return
+    # ------------------------------------------------------------------
+    # Streaming speech pipeline
+    # ------------------------------------------------------------------
 
-        # Check Jarvis-processed cache first
-        if APP_CONFIG.jarvis_voice_effects:
-            jarvis_path = self._jarvis_cache_path(text)
-            if jarvis_path.exists():
-                self._play_mp3(jarvis_path, blocking=blocking)
-                return
-            # If effects previously failed, fall back to raw cache
-            if self._jarvis_failed and jarvis_path.name in self._jarvis_failed:
-                cache_path = self._tts_cache_path(text)
-                if cache_path.exists():
-                    self._play_mp3(cache_path, blocking=blocking)
-                    return
-
-        # Check raw edge-tts cache
-        cache_path = self._tts_cache_path(text)
-        if cache_path.exists() and not APP_CONFIG.jarvis_voice_effects:
-            self._play_mp3(cache_path, blocking=blocking)
-            return
-
-        def _speak():
-            try:
-                if not cache_path.exists():
-                    _EDGE_TTS.synthesize(
-                        text=text,
-                        voice=APP_CONFIG.tts_voice,
-                        rate=APP_CONFIG.tts_rate,
-                        output_path=cache_path,
-                        timeout=20.0,
-                    )
-
-                final_path = cache_path
-                # Apply Jarvis effects if enabled
-                if APP_CONFIG.jarvis_voice_effects:
-                    jarvis_path = self._jarvis_cache_path(text)
-                    jkey = jarvis_path.name
-                    if jkey not in self._jarvis_failed and not jarvis_path.exists():
-                        try:
-                            process_audio_jarvis(
-                                input_path=cache_path,
-                                output_path=jarvis_path,
-                                reverb=APP_CONFIG.jarvis_reverb,
-                                delay=APP_CONFIG.jarvis_delay,
-                                pitch_shift=APP_CONFIG.jarvis_pitch_shift,
-                                compressor=APP_CONFIG.jarvis_compressor,
-                                chorus=APP_CONFIG.jarvis_chorus,
-                            )
-                        except Exception as e:
-                            logger.warning("Jarvis effects failed (%s), using raw TTS", e)
-                            self._jarvis_failed.add(jkey)
-                    if jarvis_path.exists():
-                        final_path = jarvis_path
-
-                snd = pygame.mixer.Sound(str(final_path))
-                channel = snd.play()
-                if channel is None:
-                    logger.warning("speak_agent: no free channel for %s, forcing one", final_path.name)
-                    channel = pygame.mixer.find_channel(force=True)
-                    if channel is not None:
-                        channel.play(snd)
-                if channel is not None:
-                    while channel.get_busy() and self._running:
-                        time_mod.sleep(0.05)
-                else:
-                    logger.error("speak_agent: could not acquire channel for %s — falling back to local TTS", final_path.name)
-                    self.speak_local(text, blocking=True)
-            except Exception as e:
-                logger.error("edge-tts error: %s", e)
-                self.speak_local(text, blocking=True)
-            finally:
-                with self._tts_lock:
-                    self._tts_busy = False
-                try:
-                    self.speech_finished.emit()
-                except RuntimeError:
-                    pass
-
+    def stream_begin(self) -> None:
+        """Open a new speech stream, cancelling anything still in flight."""
+        self._cancel_speech_locked()
+        with self._speech_lock:
+            self._stream_closed = False
+            self._items_pending = 0
         with self._tts_lock:
             self._tts_busy = True
-        t = threading.Thread(target=_speak, daemon=True)
-        t.start()
+
+    def stream_feed(self, text: str) -> None:
+        """Queue one sentence for synthesis+playback on the open stream."""
+        if not text or not text.strip():
+            return
+        with self._speech_lock:
+            if self._stream_closed:
+                logger.debug("stream_feed without open stream, dropping: %s", text[:40])
+                return
+            self._items_pending += 1
+            gen = self._speech_gen
+        self._synth_q.put((gen, text.strip()))
+
+    def stream_close(self) -> None:
+        """Mark the stream complete; speech_finished fires when playback drains."""
+        fire = False
+        with self._speech_lock:
+            if self._stream_closed:
+                return
+            self._stream_closed = True
+            gen = self._speech_gen
+            fire = self._items_pending == 0
+        if fire:
+            self._finish_stream(gen)
+
+    def _synth_worker(self) -> None:
+        while True:
+            item = self._synth_q.get()
+            if item is None:
+                break
+            gen, text = item
+            if gen != self._speech_gen:
+                continue
+            path = self._synthesize(text)
+            if gen != self._speech_gen:
+                continue
+            self._play_q.put((gen, text, path))
+
+    def _play_worker(self) -> None:
+        while True:
+            item = self._play_q.get()
+            if item is None:
+                break
+            gen, text, path = item
+            if gen != self._speech_gen:
+                continue
+            self._now_playing = text
+            try:
+                if path is not None:
+                    snd = pygame.mixer.Sound(str(path))
+                    snd.set_volume(self._voice_volume)
+                    channel = snd.play()
+                    if channel is None:
+                        channel = pygame.mixer.find_channel(force=True)
+                        if channel is not None:
+                            channel.play(snd)
+                    if channel is not None:
+                        while channel.get_busy() and self._running and gen == self._speech_gen:
+                            time_mod.sleep(0.04)
+                        if gen != self._speech_gen:
+                            try:
+                                channel.stop()
+                            except Exception:
+                                pass
+                    else:
+                        logger.error("play: no channel for %s — local TTS fallback", path.name)
+                        self._speak_local_blocking(text)
+                else:
+                    # Synthesis unavailable (edge-tts off or failed) → pyttsx3.
+                    self._speak_local_blocking(text)
+            except Exception as e:
+                logger.error("play worker error: %s", e)
+            finally:
+                self._last_played = text
+                self._now_playing = ""
+                self._dec_pending_and_maybe_finish(gen)
+
+    def _dec_pending_and_maybe_finish(self, gen: int) -> None:
+        fire = False
+        with self._speech_lock:
+            if gen == self._speech_gen:
+                self._items_pending = max(0, self._items_pending - 1)
+                fire = self._stream_closed and self._items_pending == 0
+        if fire:
+            self._finish_stream(gen)
+
+    def _finish_stream(self, gen: int) -> None:
+        if gen != self._speech_gen:
+            return
+        with self._tts_lock:
+            self._tts_busy = False
+        try:
+            self.speech_finished.emit()
+        except RuntimeError:
+            pass
+
+    def _synthesize(self, text: str) -> Optional[Path]:
+        """Text → audio file (edge-tts + optional Jarvis FX). None = use local TTS."""
+        if not APP_CONFIG.tts_use_edge:
+            return None
+        cache_path = self._tts_cache_path(text)
+        try:
+            if not cache_path.exists():
+                _EDGE_TTS.synthesize(
+                    text=text,
+                    voice=APP_CONFIG.tts_voice,
+                    rate=APP_CONFIG.tts_rate,
+                    output_path=cache_path,
+                    timeout=20.0,
+                )
+        except Exception as e:
+            logger.error("edge-tts error: %s", e)
+            return None
+
+        if APP_CONFIG.jarvis_voice_effects:
+            jarvis_path = self._jarvis_cache_path(text)
+            jkey = jarvis_path.name
+            if jkey not in self._jarvis_failed and not jarvis_path.exists():
+                try:
+                    process_audio_jarvis(
+                        input_path=cache_path,
+                        output_path=jarvis_path,
+                        reverb=APP_CONFIG.jarvis_reverb,
+                        delay=APP_CONFIG.jarvis_delay,
+                        pitch_shift=APP_CONFIG.jarvis_pitch_shift,
+                        compressor=APP_CONFIG.jarvis_compressor,
+                        chorus=APP_CONFIG.jarvis_chorus,
+                    )
+                except Exception as e:
+                    logger.warning("Jarvis effects failed (%s), using raw TTS", e)
+                    self._jarvis_failed.add(jkey)
+            if jarvis_path.exists():
+                return jarvis_path
+        return cache_path if cache_path.exists() else None
+
+    def _speak_local_blocking(self, text: str) -> None:
+        """Inline pyttsx3 fallback used by the play worker (already off-GUI)."""
+        try:
+            self._ensure_local_tts()
+        except Exception as e:
+            logger.error("Cannot init local TTS: %s", e)
+            return
+        with self._tts_local_lock:
+            try:
+                if sys.platform == "win32":
+                    import pythoncom
+                    pythoncom.CoInitialize()
+                self.tts_local.say(text)
+                self.tts_local.runAndWait()
+            except Exception as e:
+                logger.error("local TTS error: %s", e)
+            finally:
+                if sys.platform == "win32":
+                    try:
+                        pythoncom.CoUninitialize()
+                    except Exception:
+                        pass
+
+    def speak_agent(self, text: str, blocking: bool = False):
+        """Speak a complete text through the streaming pipeline.
+
+        The text is sanitized (markdown → prose) and split into sentences so
+        synthesis of sentence N+1 overlaps playback of sentence N.
+        """
+        clean = sanitize_for_speech(text) or (text or "").strip()
+        if not clean:
+            return
+        ss = SentenceStream()
+        parts = ss.feed(clean)
+        parts += ss.flush()
+        if not parts:
+            parts = [clean]
+        self.stream_begin()
+        for p in parts:
+            self.stream_feed(p)
+        self.stream_close()
         if blocking:
-            t.join()
+            deadline = time_mod.monotonic() + 300.0
+            while self.is_speaking() and time_mod.monotonic() < deadline:
+                time_mod.sleep(0.05)
+
+    def get_now_playing(self) -> str:
+        """Current + previous TTS sentence, for the barge-in echo-guard."""
+        now = self._now_playing
+        prev = self._last_played
+        return f"{prev} {now}".strip()
+
+    def adjust_voice_volume(self, step: float) -> float:
+        """Nudge the agent-voice volume (local command 'más alto/bajo')."""
+        self._voice_volume = float(np.clip(self._voice_volume + step, 0.2, 1.0))
+        return self._voice_volume
+
+    def _cleanup_tts_cache(self) -> None:
+        """Delete cached response audio older than tts_cache_max_days.
+
+        Wake responses are exempt — they're pre-generated every boot and keeping
+        them avoids re-synthesis. Response audio is almost always unique text,
+        so without this the cache grows forever.
+        """
+        max_days = getattr(APP_CONFIG, "tts_cache_max_days", 14)
+        if max_days <= 0:
+            return
+        keep: set[str] = set()
+        try:
+            from voice_effects import get_jarvis_wake_responses
+            for w in get_jarvis_wake_responses():
+                keep.add(self._tts_cache_path(w).name)
+                keep.add(self._jarvis_cache_path(w).name)
+                keep.add(self._local_tts_cache_path(w).name)
+        except Exception:
+            pass
+        cutoff = time_mod.time() - max_days * 86400
+        removed = 0
+        for d in (self._tts_cache_dir, self._jarvis_cache_dir):
+            try:
+                for f in d.iterdir():
+                    if f.name in keep or not f.is_file():
+                        continue
+                    try:
+                        if f.stat().st_mtime < cutoff:
+                            f.unlink()
+                            removed += 1
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+        if removed:
+            logger.info("TTS cache GC: %d archivos antiguos eliminados", removed)
 
     def is_speaking(self) -> bool:
         # Only TTS — UI sounds (listen_on/off, ready) share the mixer and
@@ -1074,7 +1266,22 @@ class AudioEngine(QObject):
         with self._tts_lock:
             return self._tts_busy
 
+    def _cancel_speech_locked(self) -> None:
+        """Bump the generation and drain queues; in-flight items become stale."""
+        with self._speech_lock:
+            self._speech_gen += 1
+            self._stream_closed = True
+            self._items_pending = 0
+        for q in (self._synth_q, self._play_q):
+            try:
+                while True:
+                    q.get_nowait()
+            except queue.Empty:
+                pass
+        self._now_playing = ""
+
     def stop_speaking(self):
+        self._cancel_speech_locked()
         with self._tts_lock:
             self._tts_busy = False
         try:

@@ -4,8 +4,10 @@ Transparent, frameless, centered overlay with OpenGL visuals.
 Optimizado para latencia mínima y conversación fluida.
 """
 import sys
+import math
 import random
 import logging
+import time as time_mod
 from pathlib import Path
 
 # --- Single-instance guard (cross-platform) ---
@@ -41,6 +43,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QSurfaceFormat
 
+from rapidfuzz import fuzz
+
 from state_machine import StateMachine, State
 from visual_gl import VisualGLWidget
 from audio_engine import AudioEngine, _check_wake
@@ -56,6 +60,31 @@ WAKE_RESPONSES = get_jarvis_wake_responses()
 
 OVERLAY_WIDTH = APP_CONFIG.overlay_width
 OVERLAY_HEIGHT = APP_CONFIG.overlay_height
+
+# --- Local voice commands (handled without a round-trip to the agent) ---
+# Matched against the full post-wake utterance (lowercased, ≤4 words).
+_STOP_CMDS = {
+    "para", "párale", "parale", "cállate", "callate", "silencio", "basta",
+    "stop", "detente", "alto", "cancela", "cancelar", "olvídalo", "olvidalo",
+    "déjalo", "dejalo", "nada", "ya estuvo", "nada más", "nada mas",
+}
+_REPEAT_CMDS = {
+    "repite", "repítelo", "repitelo", "repite eso", "otra vez",
+    "qué dijiste", "que dijiste", "repite por favor",
+}
+_VOL_UP_CMDS = {
+    "más alto", "mas alto", "más fuerte", "mas fuerte", "sube el volumen",
+    "sube volumen", "habla más alto", "habla mas alto",
+}
+_VOL_DOWN_CMDS = {
+    "más bajo", "mas bajo", "baja el volumen", "baja volumen",
+    "más quedito", "mas quedito", "habla más bajo", "habla mas bajo",
+}
+
+
+def _is_stop_command(text: str) -> bool:
+    t = text.strip().lower()
+    return t in _STOP_CMDS and len(t.split()) <= 2
 
 
 class GhostJarvisApp(QMainWindow):
@@ -127,6 +156,11 @@ class GhostJarvisApp(QMainWindow):
         self._listen_timer = None
         self._speech_end_timer = None
         self._pending_utterance = ""
+        # True while the current SPEAKING turn is fed by streamed sentences
+        # (sentence_ready) instead of a single speak_agent(full_text) call.
+        self._streaming_active = False
+        # Last full agent reply, for the local "repite" command.
+        self._last_response = ""
 
         # Pre-load whisper in background (200 ms after init so the UI shows first)
         QTimer.singleShot(200, self._preload_whisper)
@@ -234,7 +268,14 @@ class GhostJarvisApp(QMainWindow):
         @self.sm.on_enter(State.PROCESSING)
         def _(ctx):
             self.visual.set_state("PROCESSING", "Pensando...")
-            self.audio.pause_input()
+            # Barge-in: keep the mic open so the wake word can cancel the
+            # in-flight run (the _on_utterance PROCESSING branch). Without
+            # barge-in this used to pause input, which made that branch
+            # unreachable dead code.
+            if APP_CONFIG.barge_in_enabled:
+                self.audio.resume_input()
+            else:
+                self.audio.pause_input()
             self.audio.set_listen_mode(False)
             if self._listen_timer and self._listen_timer.isActive():
                 self._listen_timer.stop()
@@ -242,25 +283,34 @@ class GhostJarvisApp(QMainWindow):
             if not prompt:
                 self.sm.transition(State.IDLE)
                 return
+            self._streaming_active = False
             self.ghost.send(
                 prompt,
                 on_response=self._on_ghost_response,
                 on_error=self._on_ghost_error,
+                on_sentence=self._on_ghost_sentence,
             )
 
         @self.sm.on_enter(State.SPEAKING)
         def _(ctx):
             if APP_CONFIG.duck_volume_enabled:
                 save_and_duck(APP_CONFIG.duck_volume_level)
-            text = ctx.ghost_response
             self.visual.set_state("SPEAKING", "Hablando...")
-            self.audio.pause_input()
+            # Barge-in: mic stays open while we speak; _on_utterance discards
+            # echoes of our own TTS and reacts to the wake word / "cállate".
+            if APP_CONFIG.barge_in_enabled:
+                self.audio.resume_input()
+            else:
+                self.audio.pause_input()
             try:
                 self.audio.speech_finished.disconnect(self._on_speech_finished)
             except Exception:
                 pass
             self.audio.speech_finished.connect(self._on_speech_finished)
-            self.audio.speak_agent(text, blocking=False)
+            if not self._streaming_active:
+                # Non-streamed turn (kill-switch off, "repite", foreign reply,
+                # or error message): speak the full text in one call.
+                self.audio.speak_agent(ctx.ghost_response, blocking=False)
             self._speech_end_timer = QTimer(self)
             self._speech_end_timer.timeout.connect(self._check_speech_end)
             self._speech_end_timer.start(500)
@@ -406,13 +456,7 @@ class GhostJarvisApp(QMainWindow):
             self.sm.transition(State.WAKE)
         elif self.sm.state == State.SPEAKING:
             # Interrupt speaking and start listening again
-            self.audio.stop_speaking()
-            if self._speech_end_timer and self._speech_end_timer.isActive():
-                self._speech_end_timer.stop()
-            try:
-                self.audio.speech_finished.disconnect(self._on_speech_finished)
-            except Exception:
-                pass
+            self._end_speaking_turn()
             self.sm.transition(State.WAKE)
         elif self.sm.state == State.LISTENING:
             # Already listening, reset timeout
@@ -445,6 +489,8 @@ class GhostJarvisApp(QMainWindow):
                     logging.getLogger("state").debug("STANDBY ignore: %s", text)
             return
         if state == State.LISTENING:
+            if APP_CONFIG.local_commands_enabled and self._handle_local_command(text):
+                return
             self.sm.context.user_prompt = text
             self.sm.transition(State.PROCESSING)
         elif state == State.WAKE:
@@ -452,10 +498,22 @@ class GhostJarvisApp(QMainWindow):
             if not APP_CONFIG.privacy_mode:
                 logging.getLogger("state").debug("Buffered utterance during WAKE: %s", text)
         elif state == State.SPEAKING:
-            # Allow wake word to interrupt ongoing speech
-            has_wake, _ = _check_wake(text)
-            if has_wake:
-                self._on_wake()
+            # Barge-in: the mic is open while we talk, so the first job is to
+            # discard transcriptions of our own TTS coming back through it.
+            if self._is_tts_echo(text):
+                return
+            has_wake, clean = _check_wake(text)
+            if not has_wake:
+                return
+            if clean and _is_stop_command(clean):
+                # "ghost cállate" — cut the voice and go idle, no new turn.
+                logging.getLogger("state").info("Voice stop command during SPEAKING")
+                self._end_speaking_turn()
+                self.sm.transition(State.IDLE)
+                return
+            if clean:
+                self._pending_utterance = clean
+            self._on_wake()
         elif state == State.PROCESSING:
             # Wake word during processing cancels the in-flight Ghost request
             # and starts a new turn. Other speech is ignored (we cannot send
@@ -475,6 +533,76 @@ class GhostJarvisApp(QMainWindow):
                 if not APP_CONFIG.privacy_mode:
                     logging.getLogger("state").debug("IDLE ignore (no wake word): %s", text)
 
+    def _end_speaking_turn(self):
+        """Stop TTS + the end-of-speech timer and detach the finished signal.
+        Used by voice interruptions (wake word / stop command) during SPEAKING."""
+        self.audio.stop_speaking()
+        self._streaming_active = False
+        if self._speech_end_timer and self._speech_end_timer.isActive():
+            self._speech_end_timer.stop()
+        try:
+            self.audio.speech_finished.disconnect(self._on_speech_finished)
+        except Exception:
+            pass
+
+    def _is_tts_echo(self, text: str) -> bool:
+        """True if `text` looks like the mic picking up our own TTS voice.
+
+        Compares against the sentence the speaker is playing right now (plus
+        the previous one — Whisper lags the audio by a second or two). Also
+        guards the case where the agent's reply contains the word "ghost",
+        which would otherwise self-trigger the wake check.
+        """
+        now_playing = self.audio.get_now_playing()
+        if len(now_playing) < 8:
+            return False
+        score = fuzz.partial_ratio(text.lower(), now_playing.lower())
+        if score >= 75:
+            if not APP_CONFIG.privacy_mode:
+                logging.getLogger("state").debug("Discarded TTS echo (%d%%): %s", score, text[:60])
+            return True
+        return False
+
+    def _handle_local_command(self, text: str) -> bool:
+        """Intercept short utility commands in LISTENING without an agent trip.
+        Returns True if the utterance was consumed."""
+        t = text.strip().lower()
+        if len(t.split()) > 4:
+            return False
+        log = logging.getLogger("state")
+
+        if _is_stop_command(t):
+            log.info("Local command: stop/cancel")
+            if self._listen_timer and self._listen_timer.isActive():
+                self._listen_timer.stop()
+            self.sm.transition(State.IDLE)
+            return True
+
+        if t in _REPEAT_CMDS:
+            log.info("Local command: repeat")
+            if self._listen_timer and self._listen_timer.isActive():
+                self._listen_timer.stop()
+            if self._last_response:
+                self._streaming_active = False
+                self.sm.context.ghost_response = self._last_response
+                self.sm.context.session_active = False
+                self.sm.transition(State.SPEAKING)
+            else:
+                self.audio.speak_local("No hay nada que repetir.", blocking=False)
+                self.sm.transition(State.IDLE)
+            return True
+
+        if t in _VOL_UP_CMDS or t in _VOL_DOWN_CMDS:
+            step = 0.2 if t in _VOL_UP_CMDS else -0.2
+            vol = self.audio.adjust_voice_volume(step)
+            log.info("Local command: voice volume -> %.0f%%", vol * 100)
+            self.audio.play_sound("ready")
+            # Stay in LISTENING so the user can follow up with the real command.
+            self._listen_timeout = 0
+            return True
+
+        return False
+
     def _on_listening_volume(self, vol: float):
         self.visual.set_audio_volume(vol)
         if vol > 0.05:
@@ -492,13 +620,32 @@ class GhostJarvisApp(QMainWindow):
             self._listen_timer.stop()
             self.sm.transition(State.IDLE)
 
+    def _on_ghost_sentence(self, sentence: str):
+        """A streamed sentence arrived from the agent. First one flips
+        PROCESSING → SPEAKING so the voice starts seconds before the run ends."""
+        state = self.sm.state
+        if state == State.PROCESSING:
+            self._streaming_active = True
+            self.audio.stream_begin()
+            self.audio.stream_feed(sentence)
+            self.sm.transition(State.SPEAKING)
+        elif state == State.SPEAKING and self._streaming_active:
+            self.audio.stream_feed(sentence)
+        # Any other state: the turn was cancelled — drop the sentence.
+
     def _on_ghost_response(self, text: str, is_question: bool):
         if not APP_CONFIG.privacy_mode:
             logging.getLogger("ghost").debug("Response: %s | question=%s", text[:200], is_question)
         self.sm.context.ghost_response = text
         self.sm.context.session_active = is_question
+        self._last_response = text
         self._last_activity = 0
-        self.sm.transition(State.SPEAKING)
+        if self._streaming_active:
+            # Already speaking the streamed sentences; just close the stream so
+            # speech_finished fires when the queue drains.
+            self.audio.stream_close()
+        else:
+            self.sm.transition(State.SPEAKING)
 
     @pyqtSlot(str)
     def _on_foreign_response(self, text: str):
@@ -520,7 +667,9 @@ class GhostJarvisApp(QMainWindow):
         if self.audio.is_speaking():
             return
         text = self._foreign_queue.pop(0)
+        self._streaming_active = False
         self.sm.context.ghost_response = text
+        self._last_response = text
         # Webchat conversation lives in text; don't open a voice LISTENING turn.
         self.sm.context.session_active = False
         self._last_activity = 0
@@ -528,6 +677,11 @@ class GhostJarvisApp(QMainWindow):
 
     def _on_ghost_error(self, error: str):
         logging.getLogger("ghost").error("Ghost error: %s", error)
+        # If the run died mid-stream, the speech stream was never closed and
+        # _tts_busy would stay True forever, wedging SPEAKING. Cut it here.
+        if self._streaming_active:
+            self.audio.stop_speaking()
+            self._streaming_active = False
         # If the agent is unreachable, switch to STANDBY instead of speaking the raw error
         err_lower = error.lower()
         unreachable_tokens = (
@@ -543,8 +697,7 @@ class GhostJarvisApp(QMainWindow):
 
     def _update_speech_volume(self):
         if self.audio.is_speaking():
-            import math, time
-            v = 0.3 + 0.4 * abs(math.sin(time.time() * 8))
+            v = 0.3 + 0.4 * abs(math.sin(time_mod.time() * 8))
             self.visual.set_speech_volume(v)
         else:
             self.visual.set_speech_volume(0.0)
@@ -553,8 +706,17 @@ class GhostJarvisApp(QMainWindow):
         self._check_speech_end()
 
     def _check_speech_end(self):
+        # In a streamed turn the queue can be momentarily silent while the
+        # next sentence synthesizes, but _tts_busy stays True until the stream
+        # closes AND drains — so this check stays correct.
         if not self.audio.is_speaking():
-            self._speech_end_timer.stop()
+            if self.sm.state == State.SPEAKING and self._streaming_active \
+                    and self.ghost.is_busy():
+                # Stream still open (run in flight, between sentences): wait.
+                return
+            self._streaming_active = False
+            if self._speech_end_timer and self._speech_end_timer.isActive():
+                self._speech_end_timer.stop()
             try:
                 self.audio.speech_finished.disconnect(self._on_speech_finished)
             except Exception:
