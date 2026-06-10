@@ -220,14 +220,40 @@ class ConfigDialog(QDialog):
         self._grid = QCheckBox("Grid de suelo")
         vis_form.addRow(self._grid)
 
-        self._wireframe = QCheckBox("Wireframe de cubos")
+        self._wireframe = QCheckBox("Estilo cristal (aristas brillantes)")
         vis_form.addRow(self._wireframe)
 
         self._glitch = QCheckBox("Efecto glitch (procesando)")
         vis_form.addRow(self._glitch)
 
+        self._bloom = QCheckBox("Bloom (resplandor)")
+        vis_form.addRow(self._bloom)
+
+        self._bloom_intensity = QDoubleSpinBox()
+        self._bloom_intensity.setRange(0.0, 1.5)
+        self._bloom_intensity.setSingleStep(0.05)
+        self._bloom_intensity.setDecimals(2)
+        vis_form.addRow("Intensidad de bloom:", self._bloom_intensity)
+
+        self._reflection = QCheckBox("Reflejo en el suelo")
+        vis_form.addRow(self._reflection)
+
         vis_group.setLayout(vis_form)
         vbox.addWidget(vis_group)
+
+        # Overlay
+        ov_group = QGroupBox("Overlay")
+        ov_form = QFormLayout()
+        self._click_through = QCheckBox("Click-through (los clics atraviesan el overlay)")
+        ov_form.addRow(self._click_through)
+        ov_hint = QLabel(
+            "Con click-through activo, mueve el overlay con «Modo mover» "
+            "en el menú de la bandeja."
+        )
+        ov_hint.setWordWrap(True)
+        ov_form.addRow(ov_hint)
+        ov_group.setLayout(ov_form)
+        vbox.addWidget(ov_group)
 
         vbox.addStretch()
         return tab
@@ -277,6 +303,10 @@ class ConfigDialog(QDialog):
         self._grid.setChecked(APP_CONFIG.grid_enabled)
         self._wireframe.setChecked(APP_CONFIG.wireframe_enabled)
         self._glitch.setChecked(APP_CONFIG.glitch_enabled)
+        self._bloom.setChecked(APP_CONFIG.bloom_enabled)
+        self._bloom_intensity.setValue(APP_CONFIG.bloom_intensity)
+        self._reflection.setChecked(APP_CONFIG.reflection_enabled)
+        self._click_through.setChecked(APP_CONFIG.click_through)
 
     # ------------------------------------------------------------------ Helpers
     def _load_from_openclaw(self):
@@ -333,6 +363,12 @@ class ConfigDialog(QDialog):
         APP_CONFIG.grid_enabled = self._grid.isChecked()
         APP_CONFIG.wireframe_enabled = self._wireframe.isChecked()
         APP_CONFIG.glitch_enabled = self._glitch.isChecked()
+        APP_CONFIG.bloom_enabled = self._bloom.isChecked()
+        APP_CONFIG.bloom_intensity = self._bloom_intensity.value()
+        APP_CONFIG.reflection_enabled = self._reflection.isChecked()
+
+        # Overlay
+        APP_CONFIG.click_through = self._click_through.isChecked()
 
         APP_CONFIG.save()
         self.accept()
