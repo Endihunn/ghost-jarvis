@@ -106,7 +106,10 @@ void main() {
     // Glass mode: faint faces, the edges carry the form
     if (uGlassMode > 0.5) {
         c *= 0.55;
-        a = a * 0.22 + fresnel * 0.26;
+        // Vidrio ahumado: cobertura extra (0.25) SIN color añadido, para
+        // que el cristal oscurezca fondos claros detrás del overlay.
+        // Sobre fondos oscuros es invisible (el alpha solo tapa al dst).
+        a = 0.25 + a * 0.22 + fresnel * 0.26;
     }
     // HDR edges (>1) feed the bloom bright-pass
     c += mix(uColor, vec3(1.0), 0.35) * edge * (1.3 + uGlow * 1.8);
