@@ -291,6 +291,14 @@ class VisualGLWidget(QOpenGLWidget):
         self._time = 0.0
         self._last_tick = _time.perf_counter()
 
+        # Valores suavizados por estado: los colores e intensidades hacen
+        # cross-fade (~180 ms) en vez de brincar al cambiar de estado.
+        self._color_cur = QVector3D(_COLORS["IDLE"])
+        self._halo_cur = QVector3D(_HALO_COLORS["IDLE"])
+        self._scan_cur = 0.0
+        self._glitch_cur = 0.0
+        self._fresnel_cur = 3.0
+
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         fps = max(15, min(int(APP_CONFIG.visual_fps or 60), 144))
@@ -497,9 +505,9 @@ class VisualGLWidget(QOpenGLWidget):
         state = self._state
         vol = self._speech_vol if state == "SPEAKING" else 0.0
 
-        # Update cube colors based on state
-        base_col = _COLORS.get(state, _COLORS["IDLE"])
-        halo_col = _HALO_COLORS.get(state, _HALO_COLORS["IDLE"])
+        # Eased colors (cross-fade between state palettes)
+        base_col = self._color_cur
+        halo_col = self._halo_cur
         for c in self._cubes:
             c.base_color = base_col
             c.halo_color = halo_col
@@ -517,14 +525,10 @@ class VisualGLWidget(QOpenGLWidget):
         animated = state in ("WAKE", "PROCESSING", "SPEAKING")
         standby = state == "STANDBY"
 
-        # Effect intensities by state, gated by config toggles
-        scanline_int = 0.3 if state == "PROCESSING" else (0.1 if animated else 0.0)
-        glitch_int = 0.15 if state == "PROCESSING" else 0.0
-        if not APP_CONFIG.scanlines_enabled:
-            scanline_int = 0.0
-        if not APP_CONFIG.glitch_enabled:
-            glitch_int = 0.0
-        fresnel_pow = 2.0 if animated else 3.0
+        # Effect intensities, eased in _ease_state_values()
+        scanline_int = self._scan_cur
+        glitch_int = self._glitch_cur
+        fresnel_pow = self._fresnel_cur
 
         # ---- GRID PASS ----
         if APP_CONFIG.grid_enabled and not standby:
@@ -719,9 +723,33 @@ class VisualGLWidget(QOpenGLWidget):
 
     def _tick(self):
         now = _time.perf_counter()
-        self._time += min(now - self._last_tick, 0.05)
+        dt = min(now - self._last_tick, 0.05)
+        self._time += dt
         self._last_tick = now
+        self._ease_state_values(dt)
         self.update()
+
+    def _ease_state_values(self, dt: float):
+        """Exponential ease (~180 ms) of colors and effect intensities
+        toward the current state's targets."""
+        state = self._state
+        animated = state in ("WAKE", "PROCESSING", "SPEAKING")
+        scan_t = 0.3 if state == "PROCESSING" else (0.1 if animated else 0.0)
+        glitch_t = 0.15 if state == "PROCESSING" else 0.0
+        if not APP_CONFIG.scanlines_enabled:
+            scan_t = 0.0
+        if not APP_CONFIG.glitch_enabled:
+            glitch_t = 0.0
+        fresnel_t = 2.0 if animated else 3.0
+        color_t = _COLORS.get(state, _COLORS["IDLE"])
+        halo_t = _HALO_COLORS.get(state, _HALO_COLORS["IDLE"])
+
+        k = 1.0 - math.exp(-dt / 0.18)
+        self._color_cur = self._color_cur + (color_t - self._color_cur) * k
+        self._halo_cur = self._halo_cur + (halo_t - self._halo_cur) * k
+        self._scan_cur += (scan_t - self._scan_cur) * k
+        self._glitch_cur += (glitch_t - self._glitch_cur) * k
+        self._fresnel_cur += (fresnel_t - self._fresnel_cur) * k
 
     def _cleanup_gl(self):
         self.makeCurrent()
