@@ -170,7 +170,7 @@ out vec4 FragColor;
 void main() {
     float dist = length(gl_PointCoord - vec2(0.5));
     if (dist > 0.5) discard;
-    float glow = 1.0 - smoothstep(0.0, 0.5, dist);
+    float glow = pow(1.0 - smoothstep(0.0, 0.5, dist), 1.4);
     FragColor = vec4(uColor, vAlpha * glow);
 }
 """
@@ -335,6 +335,11 @@ _DIAMOND_ROWS = [
     [-1, 1],
     [0],
 ]
+
+# Plano del piso (grid + reflejo) y encuadre de cámara. A -2.0 el reflejo
+# proyectaba fuera del cuadro; a -1.35 queda anclado bajo el diamante.
+_FLOOR_Y = -1.35
+_CAM_Z = 6.4
 
 # High-tech color palette
 _COLORS = {
@@ -582,9 +587,10 @@ class VisualGLWidget(QOpenGLWidget):
         glBindVertexArray(0)
 
         # Grid VAO (simple plane)
+        g, fy = 2.6, _FLOOR_Y
         grid_verts = np.array([
-            [-3.0, -2.0, -3.0], [3.0, -2.0, -3.0], [3.0, -2.0, 3.0],
-            [-3.0, -2.0, -3.0], [3.0, -2.0, 3.0], [-3.0, -2.0, 3.0],
+            [-g, fy, -g], [g, fy, -g], [g, fy, g],
+            [-g, fy, -g], [g, fy, g], [-g, fy, g],
         ], dtype=np.float32)
         self._grid_vao = glGenVertexArrays(1)
         glBindVertexArray(self._grid_vao)
@@ -653,9 +659,11 @@ class VisualGLWidget(QOpenGLWidget):
         self._proj = QMatrix4x4()
         self._proj.perspective(45.0, self._aspect, 0.1, 100.0)
         self._view = QMatrix4x4()
+        # Encuadre ajustado: el diamante llena ~45% del alto (antes ~33%) y
+        # el centro mira ligeramente abajo para darle aire al reflejo.
         self._view.lookAt(
-            QVector3D(0.0, 0.0, 8.5),
-            QVector3D(0.0, 0.0, 0.0),
+            QVector3D(0.0, 0.0, _CAM_Z),
+            QVector3D(0.0, -0.15, 0.0),
             QVector3D(0.0, 1.0, 0.0),
         )
         self._ensure_bloom_targets(*self._fb_size)
@@ -811,6 +819,41 @@ class VisualGLWidget(QOpenGLWidget):
         glitch_int = self._glitch_cur
         fresnel_pow = self._fresnel_cur
 
+        # ---- REFLECTION PASS (cubos espejados bajo el piso) ----
+        if APP_CONFIG.reflection_enabled and not standby:
+            glUseProgram(self._prog)
+            glBindVertexArray(self._vao)
+            col2 = self._color2_cur
+            glUniform3f(self._uni["uColor2"], col2.x(), col2.y(), col2.z())
+            glUniform1f(self._uni["uEdgeWidth"], 0.07)
+            glUniform1f(self._uni["uGlassMode"], 1.0 if APP_CONFIG.wireframe_enabled else 0.0)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            glDepthMask(GL_FALSE)
+            # Espejo en espacio de mundo respecto al plano y=_FLOOR_Y,
+            # aplicado después de la rotación global.
+            mirror = QMatrix4x4()
+            mirror.translate(0.0, _FLOOR_Y, 0.0)
+            mirror.scale(1.0, -1.0, 1.0)
+            mirror.translate(0.0, -_FLOOR_Y, 0.0)
+            rot_mirror = mirror * rot
+            for c in self._cubes:
+                # Desvanecer con la altura: solo los cubos bajos reflejan
+                fade = 0.20 * max(0.0, 1.0 - (c.y - _FLOOR_Y) / 1.6)
+                if fade <= 0.005:
+                    continue
+                dist = math.sqrt(c.x * c.x + c.y * c.y)
+                dist_norm = min(dist / max_dist, 1.0)
+                scale, glow, z_off, px, py, disp = self._cube_params(c, t, state, vol, dist_norm)
+                glUniform1f(self._uni["uAlphaMul"], fade)
+                self._draw_cube(
+                    rot_mirror, c, scale, glow * 0.8, z_off, px, py, c.base_color, t,
+                    breath_amp=0.021, scanline=0.0, glitch=0.0,
+                    fresnel=fresnel_pow, displacement=disp
+                )
+            glDepthMask(GL_TRUE)
+            glUniform1f(self._uni["uAlphaMul"], 1.0)
+            glBindVertexArray(0)
+
         # ---- GRID PASS ----
         if APP_CONFIG.grid_enabled and not standby:
             glUseProgram(self._grid_prog)
@@ -875,7 +918,7 @@ class VisualGLWidget(QOpenGLWidget):
             self._mvp_buf[:] = (self._proj * self._view * rot).data()
             glUniformMatrix4fv(self._puni["uMVP"], 1, GL_FALSE, self._mvp_buf)
             glUniform1f(self._puni["uTime"], t)
-            glUniform1f(self._puni["uParticleSize"], 4.0 + vol * 6.0)
+            glUniform1f(self._puni["uParticleSize"], 3.2 + vol * 6.0)
             glUniform1f(self._puni["uStateIntensity"], 1.0 if animated else 0.6)
             glUniform3f(self._puni["uColor"], base_col.x(), base_col.y(), base_col.z())
             glDrawArrays(GL_POINTS, 0, self._particle_count)
