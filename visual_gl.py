@@ -6,6 +6,7 @@ Renders a diamond of emissive cubes with high-tech holographic effects:
 - Holographic grid floor, expansion rings
 - Real audio spectrum reactivity
 """
+import colorsys
 import math
 import logging
 import random
@@ -41,6 +42,7 @@ uniform float uDisplacement;
 
 out vec3 vWorldPos;
 out vec3 vNormal;
+out vec3 vLocalPos;
 out float vDistFromCenter;
 
 void main() {
@@ -49,6 +51,7 @@ void main() {
     p += aNormal * (breath + uDisplacement) * uScale;
     vWorldPos = p;
     vNormal = aNormal;
+    vLocalPos = aPos;
     vDistFromCenter = length(p.xy);
     gl_Position = uMVP * vec4(p, 1.0);
 }
@@ -58,14 +61,19 @@ _FRAG = """
 #version 330 core
 in vec3 vWorldPos;
 in vec3 vNormal;
+in vec3 vLocalPos;
 in float vDistFromCenter;
 
 uniform vec3 uColor;
+uniform vec3 uColor2;
 uniform float uGlow;
 uniform float uTime;
 uniform float uScanlineIntensity;
 uniform float uGlitchIntensity;
 uniform float uFresnelPower;
+uniform float uEdgeWidth;
+uniform float uGlassMode;
+uniform float uAlphaMul;
 
 out vec4 FragColor;
 
@@ -79,6 +87,31 @@ void main() {
     float fresnel = pow(1.0 - abs(dot(viewDir, vNormal)), uFresnelPower);
     c += uColor * fresnel * uGlow * 2.0;
     a += fresnel * 0.15;
+
+    // Subtle iridescence: drift toward a hue-rotated sibling at grazing angles
+    c += (uColor2 - uColor) * pow(fresnel, 1.5) * 0.25;
+
+    // Beveled edge: distance to the nearest cube edge in (undisplaced)
+    // local space. Near an edge the two largest |coords| approach 0.5,
+    // so the median component approaches 1 after the *2 normalization.
+    vec3 q = abs(vLocalPos) * 2.0;
+    float mx = max(q.x, max(q.y, q.z));
+    float mn = min(q.x, min(q.y, q.z));
+    float med = q.x + q.y + q.z - mx - mn;
+    float edgeDist = 1.0 - med;
+    float w = fwidth(edgeDist) * 1.5;
+    float edge = 1.0 - smoothstep(uEdgeWidth - w, uEdgeWidth + w, edgeDist);
+
+    // Glass mode: faint faces, the edges carry the form
+    if (uGlassMode > 0.5) {
+        c *= 0.55;
+        a = a * 0.16 + fresnel * 0.22;
+    }
+    c += mix(uColor, vec3(1.0), 0.35) * edge * (0.6 + uGlow * 1.4);
+    a += edge * (uGlassMode > 0.5 ? 0.55 : 0.25);
+
+    // Soft top light
+    c *= 0.92 + 0.16 * clamp(vLocalPos.y + 0.5, 0.0, 1.0);
 
     // Scanlines
     if (uScanlineIntensity > 0.0) {
@@ -99,7 +132,7 @@ void main() {
     float centerBoost = 1.0 - clamp(vDistFromCenter / 2.5, 0.0, 1.0);
     c += uColor * centerBoost * uGlow * 0.5;
 
-    FragColor = vec4(c, clamp(a, 0.0, 1.0));
+    FragColor = vec4(c, clamp(a, 0.0, 1.0) * uAlphaMul);
 }
 """
 
@@ -262,6 +295,16 @@ _HALO_COLORS = {
 }
 
 
+def _hue_shift(v: QVector3D, deg: float) -> QVector3D:
+    h, l, s = colorsys.rgb_to_hls(v.x(), v.y(), v.z())
+    r, g, b = colorsys.hls_to_rgb((h + deg / 360.0) % 1.0, l, s)
+    return QVector3D(r, g, b)
+
+
+# Iridescent sibling per state (hue +18°) for the fresnel color drift
+_COLORS2 = {k: _hue_shift(v, 18.0) for k, v in _COLORS.items()}
+
+
 class Cube:
     __slots__ = ("x", "y", "z_base", "idx", "phase", "base_color", "halo_color")
 
@@ -295,6 +338,7 @@ class VisualGLWidget(QOpenGLWidget):
         # cross-fade (~180 ms) en vez de brincar al cambiar de estado.
         self._color_cur = QVector3D(_COLORS["IDLE"])
         self._halo_cur = QVector3D(_HALO_COLORS["IDLE"])
+        self._color2_cur = QVector3D(_COLORS2["IDLE"])
         self._scan_cur = 0.0
         self._glitch_cur = 0.0
         self._fresnel_cur = 3.0
@@ -456,6 +500,10 @@ class VisualGLWidget(QOpenGLWidget):
         self._uni["uGlitchIntensity"] = glGetUniformLocation(self._prog, "uGlitchIntensity")
         self._uni["uFresnelPower"] = glGetUniformLocation(self._prog, "uFresnelPower")
         self._uni["uDisplacement"] = glGetUniformLocation(self._prog, "uDisplacement")
+        self._uni["uColor2"] = glGetUniformLocation(self._prog, "uColor2")
+        self._uni["uEdgeWidth"] = glGetUniformLocation(self._prog, "uEdgeWidth")
+        self._uni["uGlassMode"] = glGetUniformLocation(self._prog, "uGlassMode")
+        self._uni["uAlphaMul"] = glGetUniformLocation(self._prog, "uAlphaMul")
 
         self._puni["uMVP"] = glGetUniformLocation(self._particle_prog, "uMVP")
         self._puni["uTime"] = glGetUniformLocation(self._particle_prog, "uTime")
@@ -544,14 +592,17 @@ class VisualGLWidget(QOpenGLWidget):
             glDrawArrays(GL_TRIANGLES, 0, 6)
             glBindVertexArray(0)
 
-        # Wireframe mode for cube passes if enabled in config
-        wireframe = bool(APP_CONFIG.wireframe_enabled)
-        if wireframe:
-            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
-
         # ---- HALO PASS (additive) ----
         glUseProgram(self._prog)
         glBindVertexArray(self._vao)
+        # Per-frame material uniforms, shared by the halo and solid passes.
+        # wireframe_enabled selecciona el estilo cristal/aristas (antes
+        # alternaba el wireframe GL_LINE legacy).
+        col2 = self._color2_cur
+        glUniform3f(self._uni["uColor2"], col2.x(), col2.y(), col2.z())
+        glUniform1f(self._uni["uEdgeWidth"], 0.07)
+        glUniform1f(self._uni["uGlassMode"], 1.0 if APP_CONFIG.wireframe_enabled else 0.0)
+        glUniform1f(self._uni["uAlphaMul"], 1.0)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE)
         for c in self._cubes:
             dist = math.sqrt(c.x * c.x + c.y * c.y)
@@ -579,10 +630,6 @@ class VisualGLWidget(QOpenGLWidget):
             )
 
         glBindVertexArray(0)
-
-        # Restore fill mode for particles/rings (which use point sprites/quads)
-        if wireframe:
-            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
 
         # ---- PARTICLE PASS ----
         if APP_CONFIG.particles_enabled:
@@ -743,10 +790,12 @@ class VisualGLWidget(QOpenGLWidget):
         fresnel_t = 2.0 if animated else 3.0
         color_t = _COLORS.get(state, _COLORS["IDLE"])
         halo_t = _HALO_COLORS.get(state, _HALO_COLORS["IDLE"])
+        color2_t = _COLORS2.get(state, _COLORS2["IDLE"])
 
         k = 1.0 - math.exp(-dt / 0.18)
         self._color_cur = self._color_cur + (color_t - self._color_cur) * k
         self._halo_cur = self._halo_cur + (halo_t - self._halo_cur) * k
+        self._color2_cur = self._color2_cur + (color2_t - self._color2_cur) * k
         self._scan_cur += (scan_t - self._scan_cur) * k
         self._glitch_cur += (glitch_t - self._glitch_cur) * k
         self._fresnel_cur += (fresnel_t - self._fresnel_cur) * k
