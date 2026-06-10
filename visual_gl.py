@@ -244,6 +244,67 @@ void main() {
 }
 """
 
+# ---------------------------------------------------------------------------
+# Post-processing (real bloom): fullscreen triangle + bright-pass +
+# separable gaussian blur + composite copy.
+# ---------------------------------------------------------------------------
+_FS_VERT = """
+#version 330 core
+out vec2 vUV;
+void main() {
+    // Fullscreen triangle from gl_VertexID (no VBO; a dummy VAO is bound)
+    vec2 pos = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    vUV = pos;
+    gl_Position = vec4(pos * 2.0 - 1.0, 0.0, 1.0);
+}
+"""
+
+_BRIGHT_FRAG = """
+#version 330 core
+in vec2 vUV;
+uniform sampler2D uTex;
+uniform float uThreshold;
+out vec4 FragColor;
+void main() {
+    vec4 s = texture(uTex, vUV);
+    float luma = dot(s.rgb, vec3(0.2126, 0.7152, 0.0722));
+    // Soft knee around the threshold
+    float knee = uThreshold * 0.5;
+    float soft = clamp((luma - uThreshold + knee) / (2.0 * knee), 0.0, 1.0);
+    float contrib = max(luma - uThreshold, 0.0) + soft * soft * knee;
+    float w = contrib / max(luma, 1e-4);
+    FragColor = vec4(s.rgb * w, s.a * w);
+}
+"""
+
+_BLUR_FRAG = """
+#version 330 core
+in vec2 vUV;
+uniform sampler2D uTex;
+uniform vec2 uDir;   // (1/w, 0) horizontal or (0, 1/h) vertical
+out vec4 FragColor;
+void main() {
+    // 9-tap separable gaussian
+    vec4 c = texture(uTex, vUV) * 0.227027;
+    c += (texture(uTex, vUV + uDir * 1.0) + texture(uTex, vUV - uDir * 1.0)) * 0.194594;
+    c += (texture(uTex, vUV + uDir * 2.0) + texture(uTex, vUV - uDir * 2.0)) * 0.121622;
+    c += (texture(uTex, vUV + uDir * 3.0) + texture(uTex, vUV - uDir * 3.0)) * 0.054054;
+    c += (texture(uTex, vUV + uDir * 4.0) + texture(uTex, vUV - uDir * 4.0)) * 0.016216;
+    FragColor = c;
+}
+"""
+
+_COPY_FRAG = """
+#version 330 core
+in vec2 vUV;
+uniform sampler2D uTex;
+uniform float uIntensity;
+out vec4 FragColor;
+void main() {
+    FragColor = texture(uTex, vUV) * uIntensity;
+}
+"""
+
 # Cube geometry with correct per-face normals (36 vertices, no index buffer needed)
 def _build_cube():
     h = 0.5
@@ -375,6 +436,24 @@ class VisualGLWidget(QOpenGLWidget):
         self._guni = {}
         self._runi = {}
 
+        # Bloom post-processing state. _bloom_ok=False ⇒ legacy halo path.
+        self._bloom_ok = False
+        self._fb_size = (0, 0)       # last resizeGL size (viewport convention)
+        self._bloom_size = (0, 0)    # size the FBO targets were allocated at
+        self._blur_size = (1, 1)
+        self._scene_fbo = 0
+        self._scene_tex = 0
+        self._scene_depth = 0
+        self._ping_fbo = [0, 0]
+        self._ping_tex = [0, 0]
+        self._fs_vao = 0
+        self._bright_prog = 0
+        self._blur_prog = 0
+        self._copy_prog = 0
+        self._buni = {}
+        self._bluni = {}
+        self._cuni = {}
+
         # Precomputed matrices
         self._proj = QMatrix4x4()
         self._view = QMatrix4x4()
@@ -418,6 +497,52 @@ class VisualGLWidget(QOpenGLWidget):
         except Exception as e:
             logger.error("Shader compile error: %s", e)
             return
+
+        # Post-processing programs — failing here only disables real bloom;
+        # the legacy halo pass keeps working.
+        try:
+            self._bright_prog = compileProgram(
+                compileShader(_FS_VERT, GL_VERTEX_SHADER),
+                compileShader(_BRIGHT_FRAG, GL_FRAGMENT_SHADER),
+            )
+            self._blur_prog = compileProgram(
+                compileShader(_FS_VERT, GL_VERTEX_SHADER),
+                compileShader(_BLUR_FRAG, GL_FRAGMENT_SHADER),
+            )
+            self._copy_prog = compileProgram(
+                compileShader(_FS_VERT, GL_VERTEX_SHADER),
+                compileShader(_COPY_FRAG, GL_FRAGMENT_SHADER),
+            )
+            # Dummy VAO: core profile requires one bound even for
+            # attribute-less fullscreen-triangle draws.
+            self._fs_vao = glGenVertexArrays(1)
+            self._buni = {
+                "uTex": glGetUniformLocation(self._bright_prog, "uTex"),
+                "uThreshold": glGetUniformLocation(self._bright_prog, "uThreshold"),
+            }
+            self._bluni = {
+                "uTex": glGetUniformLocation(self._blur_prog, "uTex"),
+                "uDir": glGetUniformLocation(self._blur_prog, "uDir"),
+            }
+            self._cuni = {
+                "uTex": glGetUniformLocation(self._copy_prog, "uTex"),
+                "uIntensity": glGetUniformLocation(self._copy_prog, "uIntensity"),
+            }
+            self._bloom_ok = True
+        except Exception as e:
+            logger.warning("Bloom unavailable (%s); using legacy halo pass.", e)
+            self._bloom_ok = False
+
+        # Si el contexto muere (recreación de ventana nativa), zerear los
+        # handles para que un initializeGL re-entrante arranque limpio.
+        try:
+            ctx = self.context()
+            if ctx is not None:
+                ctx.aboutToBeDestroyed.connect(
+                    self._release_gl_handles, Qt.ConnectionType.UniqueConnection
+                )
+        except Exception:
+            pass
 
         # Cube VAO
         self._vao = glGenVertexArrays(1)
@@ -523,6 +648,7 @@ class VisualGLWidget(QOpenGLWidget):
 
     def resizeGL(self, w, h):
         glViewport(0, 0, w, h)
+        self._fb_size = (max(1, int(w)), max(1, int(h)))
         self._aspect = w / h if h else 1.0
         self._proj = QMatrix4x4()
         self._proj.perspective(45.0, self._aspect, 0.1, 100.0)
@@ -532,12 +658,104 @@ class VisualGLWidget(QOpenGLWidget):
             QVector3D(0.0, 0.0, 0.0),
             QVector3D(0.0, 1.0, 0.0),
         )
+        self._ensure_bloom_targets(*self._fb_size)
+
+    def _ensure_bloom_targets(self, w: int, h: int):
+        """(Re)create the HDR scene FBO and the half-res blur ping/pong
+        FBOs at the given pixel size. Context must be current."""
+        if not self._bloom_ok or (w, h) == self._bloom_size or w <= 0 or h <= 0:
+            return
+        self._destroy_bloom_targets()
+        try:
+            def _make_tex(tw, th):
+                tex = glGenTextures(1)
+                glBindTexture(GL_TEXTURE_2D, tex)
+                # RGBA16F: el shader emite hasta ~3.5; HDR libera esos
+                # valores para el bright-pass en vez de clampear a 1.0.
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, tw, th, 0,
+                             GL_RGBA, GL_FLOAT, None)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+                return tex
+
+            self._scene_tex = _make_tex(w, h)
+            self._scene_depth = glGenRenderbuffers(1)
+            glBindRenderbuffer(GL_RENDERBUFFER, self._scene_depth)
+            glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h)
+            self._scene_fbo = glGenFramebuffers(1)
+            glBindFramebuffer(GL_FRAMEBUFFER, self._scene_fbo)
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, self._scene_tex, 0)
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                      GL_RENDERBUFFER, self._scene_depth)
+            ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE
+
+            bw, bh = max(1, w // 2), max(1, h // 2)
+            for i in range(2):
+                self._ping_tex[i] = _make_tex(bw, bh)
+                self._ping_fbo[i] = glGenFramebuffers(1)
+                glBindFramebuffer(GL_FRAMEBUFFER, self._ping_fbo[i])
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                       GL_TEXTURE_2D, self._ping_tex[i], 0)
+                ok = ok and (glCheckFramebufferStatus(GL_FRAMEBUFFER)
+                             == GL_FRAMEBUFFER_COMPLETE)
+
+            glBindFramebuffer(GL_FRAMEBUFFER, self.defaultFramebufferObject())
+            glBindTexture(GL_TEXTURE_2D, 0)
+            glBindRenderbuffer(GL_RENDERBUFFER, 0)
+
+            if not ok:
+                logger.warning("Bloom FBO incomplete; using legacy halo pass.")
+                self._destroy_bloom_targets()
+                self._bloom_ok = False
+                return
+            self._bloom_size = (w, h)
+            self._blur_size = (bw, bh)
+        except Exception as e:
+            logger.warning("Bloom FBO setup failed (%s); legacy halo pass.", e)
+            self._destroy_bloom_targets()
+            self._bloom_ok = False
+
+    def _destroy_bloom_targets(self):
+        try:
+            if self._scene_fbo:
+                glDeleteFramebuffers(1, [self._scene_fbo])
+            if self._scene_depth:
+                glDeleteRenderbuffers(1, [self._scene_depth])
+            if self._scene_tex:
+                glDeleteTextures([self._scene_tex])
+            for i in range(2):
+                if self._ping_fbo[i]:
+                    glDeleteFramebuffers(1, [self._ping_fbo[i]])
+                if self._ping_tex[i]:
+                    glDeleteTextures([self._ping_tex[i]])
+        except Exception:
+            pass
+        self._scene_fbo = self._scene_tex = self._scene_depth = 0
+        self._ping_fbo = [0, 0]
+        self._ping_tex = [0, 0]
+        self._bloom_size = (0, 0)
+
+    def _release_gl_handles(self):
+        """The GL context is about to die (native window re-creation):
+        drop every handle so a re-entrant initializeGL starts clean."""
+        self._vbos.clear()
+        self._prog = self._particle_prog = self._grid_prog = self._ring_prog = 0
+        self._vao = self._particle_vao = self._grid_vao = self._ring_vao = 0
+        self._bright_prog = self._blur_prog = self._copy_prog = 0
+        self._fs_vao = 0
+        self._scene_fbo = self._scene_tex = self._scene_depth = 0
+        self._ping_fbo = [0, 0]
+        self._ping_tex = [0, 0]
+        self._bloom_size = (0, 0)
+        self._bloom_ok = False
 
     def paintGL(self):
-        glClearColor(0.0, 0.0, 0.0, 0.0)
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-
         if not self._prog:
+            glClearColor(0.0, 0.0, 0.0, 0.0)
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
             from PyQt6.QtGui import QPainter, QColor, QBrush, QPen
             p = QPainter(self)
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -548,6 +766,21 @@ class VisualGLWidget(QOpenGLWidget):
             p.drawEllipse(cx - size, cy - size, size * 2, size * 2)
             p.end()
             return
+
+        # Con bloom real la escena se dibuja a un FBO HDR y se compone al
+        # final; sin él (config o fallback) se dibuja directo como siempre.
+        use_bloom = (
+            self._bloom_ok
+            and bool(APP_CONFIG.bloom_enabled)
+            and bool(self._scene_fbo)
+            and self._bloom_size == self._fb_size
+        )
+        if use_bloom:
+            glBindFramebuffer(GL_FRAMEBUFFER, self._scene_fbo)
+            glViewport(0, 0, self._fb_size[0], self._fb_size[1])
+
+        glClearColor(0.0, 0.0, 0.0, 0.0)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
         t = self._time
         state = self._state
@@ -604,18 +837,21 @@ class VisualGLWidget(QOpenGLWidget):
         glUniform1f(self._uni["uGlassMode"], 1.0 if APP_CONFIG.wireframe_enabled else 0.0)
         glUniform1f(self._uni["uAlphaMul"], 1.0)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE)
-        for c in self._cubes:
-            dist = math.sqrt(c.x * c.x + c.y * c.y)
-            dist_norm = min(dist / max_dist, 1.0)
-            scale, glow, z_off, px, py, disp = self._cube_params(c, t, state, vol, dist_norm)
-            halo_boost = 1.0 if animated else (0.55 if standby else 0.75)
-            halo_scale = scale * (1.6 + glow * 2.2 * halo_boost)
-            halo_glow = glow * 0.75 * halo_boost
-            self._draw_cube(
-                rot, c, halo_scale, halo_glow, z_off, px, py, c.halo_color, t,
-                breath_amp=0.042, scanline=scanline_int, glitch=glitch_int,
-                fresnel=fresnel_pow, displacement=disp
-            )
+        # Camino legacy únicamente: con bloom real el glow sale del
+        # post-proceso, no de redibujar los cubos escalados.
+        if not use_bloom:
+            for c in self._cubes:
+                dist = math.sqrt(c.x * c.x + c.y * c.y)
+                dist_norm = min(dist / max_dist, 1.0)
+                scale, glow, z_off, px, py, disp = self._cube_params(c, t, state, vol, dist_norm)
+                halo_boost = 1.0 if animated else (0.55 if standby else 0.75)
+                halo_scale = scale * (1.6 + glow * 2.2 * halo_boost)
+                halo_glow = glow * 0.75 * halo_boost
+                self._draw_cube(
+                    rot, c, halo_scale, halo_glow, z_off, px, py, c.halo_color, t,
+                    breath_amp=0.042, scanline=scanline_int, glitch=glitch_int,
+                    fresnel=fresnel_pow, displacement=disp
+                )
 
         # ---- SOLID PASS ----
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
@@ -673,7 +909,71 @@ class VisualGLWidget(QOpenGLWidget):
                 glDrawArrays(GL_TRIANGLES, 0, 6)
             glBindVertexArray(0)
 
+        if use_bloom:
+            self._composite_bloom()
+
         glUseProgram(0)
+
+    def _composite_bloom(self):
+        """Bright-pass + separable blur de la escena HDR y composición al
+        FBO de respaldo del widget, preservando el alpha de la escena."""
+        w, h = self._fb_size
+        bw, bh = self._blur_size
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_BLEND)
+        glBindVertexArray(self._fs_vao)
+        glActiveTexture(GL_TEXTURE0)
+
+        # Bright-pass: escena -> ping0 (media resolución)
+        glBindFramebuffer(GL_FRAMEBUFFER, self._ping_fbo[0])
+        glViewport(0, 0, bw, bh)
+        glClearColor(0.0, 0.0, 0.0, 0.0)
+        glClear(GL_COLOR_BUFFER_BIT)
+        glUseProgram(self._bright_prog)
+        glBindTexture(GL_TEXTURE_2D, self._scene_tex)
+        glUniform1i(self._buni["uTex"], 0)
+        glUniform1f(self._buni["uThreshold"], 0.85)
+        glDrawArrays(GL_TRIANGLES, 0, 3)
+
+        # Blur gaussiano separable: H (ping0->ping1), V (ping1->ping0)
+        glUseProgram(self._blur_prog)
+        glUniform1i(self._bluni["uTex"], 0)
+        glBindFramebuffer(GL_FRAMEBUFFER, self._ping_fbo[1])
+        glClear(GL_COLOR_BUFFER_BIT)
+        glBindTexture(GL_TEXTURE_2D, self._ping_tex[0])
+        glUniform2f(self._bluni["uDir"], 1.0 / bw, 0.0)
+        glDrawArrays(GL_TRIANGLES, 0, 3)
+        glBindFramebuffer(GL_FRAMEBUFFER, self._ping_fbo[0])
+        glClear(GL_COLOR_BUFFER_BIT)
+        glBindTexture(GL_TEXTURE_2D, self._ping_tex[1])
+        glUniform2f(self._bluni["uDir"], 0.0, 1.0 / bh)
+        glDrawArrays(GL_TRIANGLES, 0, 3)
+
+        # Composite al FBO de respaldo de QOpenGLWidget — NUNCA bind 0.
+        glBindFramebuffer(GL_FRAMEBUFFER, self.defaultFramebufferObject())
+        glViewport(0, 0, w, h)
+        glClearColor(0.0, 0.0, 0.0, 0.0)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        glUseProgram(self._copy_prog)
+        glUniform1i(self._cuni["uTex"], 0)
+        # 1) Escena con blending OFF: el alpha queda bit-idéntico al render
+        #    directo (crítico para la ventana translúcida / DWM).
+        glBindTexture(GL_TEXTURE_2D, self._scene_tex)
+        glUniform1f(self._cuni["uIntensity"], 1.0)
+        glDrawArrays(GL_TRIANGLES, 0, 3)
+        # 2) Bloom aditivo en color Y alpha (DWM compone por alpha de
+        #    ventana; RGB aditivo con alpha 0 sería invisible).
+        glEnable(GL_BLEND)
+        glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ONE)
+        glBindTexture(GL_TEXTURE_2D, self._ping_tex[0])
+        glUniform1f(self._cuni["uIntensity"], max(0.0, float(APP_CONFIG.bloom_intensity)))
+        glDrawArrays(GL_TRIANGLES, 0, 3)
+
+        # Restaurar estado para el siguiente frame / camino legacy
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glEnable(GL_DEPTH_TEST)
+        glBindVertexArray(0)
+        glBindTexture(GL_TEXTURE_2D, 0)
 
     def _cube_params(self, c: Cube, t: float, state: str, vol: float, dist_norm: float):
         scale = 1.0
@@ -803,16 +1103,20 @@ class VisualGLWidget(QOpenGLWidget):
     def _cleanup_gl(self):
         self.makeCurrent()
         try:
-            for vao in [self._vao, self._particle_vao, self._grid_vao, self._ring_vao]:
+            for vao in [self._vao, self._particle_vao, self._grid_vao,
+                        self._ring_vao, self._fs_vao]:
                 if vao:
                     glDeleteVertexArrays(1, [vao])
-            for prog in [self._prog, self._particle_prog, self._grid_prog, self._ring_prog]:
+            for prog in [self._prog, self._particle_prog, self._grid_prog,
+                         self._ring_prog, self._bright_prog, self._blur_prog,
+                         self._copy_prog]:
                 if prog:
                     glDeleteProgram(prog)
             for vbo in self._vbos:
                 if vbo:
                     glDeleteBuffers(1, [vbo])
             self._vbos.clear()
+            self._destroy_bloom_targets()
         except Exception:
             pass
         finally:
