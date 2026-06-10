@@ -41,6 +41,7 @@ def main():
         vw._scan_cur = 0.3 if s == "PROCESSING" else (0.1 if animated else 0.0)
         vw._glitch_cur = 0.08 if s == "PROCESSING" else 0.0
         vw._fresnel_cur = 2.0 if animated else 3.0
+        vw._echo_cur = 1.0 if s == "PROCESSING" else 0.0
         vw._rings.clear()
         vw._time += 2.7  # advance animation phase, expire leftovers
         app.processEvents()

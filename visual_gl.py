@@ -415,6 +415,8 @@ class VisualGLWidget(QOpenGLWidget):
         self._scan_cur = 0.0
         self._glitch_cur = 0.0
         self._fresnel_cur = 3.0
+        # Envolvente del eco "descuadrado" (contorno fantasma en PROCESSING)
+        self._echo_cur = 0.0
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -921,6 +923,24 @@ class VisualGLWidget(QOpenGLWidget):
                 fresnel=fresnel_pow, displacement=disp
             )
 
+        # ---- GHOST ECHO (descuadre al pensar) ----
+        # Contorno fantasma additive con las caras desplazadas a CONTRAFASE
+        # del cubo principal: dos juegos de aristas desfasándose entre sí,
+        # heredero del doble contorno descuadrado del halo wireframe legacy.
+        if self._echo_cur > 0.02:
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+            glUniform1f(self._uni["uAlphaMul"], 0.35 * self._echo_cur)
+            for c in self._cubes:
+                dist = math.sqrt(c.x * c.x + c.y * c.y)
+                dist_norm = min(dist / max_dist, 1.0)
+                scale, glow, z_off, px, py, disp = self._cube_params(c, t, state, vol, dist_norm)
+                self._draw_cube(
+                    rot, c, scale * 1.05, glow * 0.5, z_off, px, py, c.halo_color, t,
+                    breath_amp=0.05, scanline=0.0, glitch=glitch_int,
+                    fresnel=fresnel_pow, displacement=-(disp * 1.4) - 0.045
+                )
+            glUniform1f(self._uni["uAlphaMul"], 1.0)
+
         glBindVertexArray(0)
 
         # ---- PARTICLE PASS ----
@@ -1052,27 +1072,29 @@ class VisualGLWidget(QOpenGLWidget):
             flash = math.exp(-((t % 2.0) * 4.0)) * 0.35
             glow = 0.85 + flash
             scale = 1.05 + flash * 0.12
-            displacement = flash * 0.1
+            displacement = flash * 0.15
         elif state == "LISTENING":
             glow = 0.15 + math.sin(t * 2.0 + c.idx * 0.8) * 0.08
             # React to audio spectrum
             spec_idx = min(c.idx, 7)
             spec_val = self._spectrum[spec_idx] if spec_idx < len(self._spectrum) else 0.0
             glow += spec_val * 0.3
-            displacement = spec_val * 0.05
+            displacement = spec_val * 0.08
         elif state == "PROCESSING":
             wave = math.sin(t * 3.5 + c.idx * 0.9) * 0.5 + 0.5
             glow = 0.40 + wave * 0.55 + radial_wave * 0.25
-            scale = 1.0 + wave * 0.03 + radial_wave * 0.02
-            z_off = math.sin(t * 4.0 + dist_norm * 5.0) * 0.08
-            displacement = math.sin(t * 6.0 + c.idx) * 0.08
+            scale = 1.0 + wave * 0.045 + radial_wave * 0.02
+            z_off = math.sin(t * 4.0 + dist_norm * 5.0) * 0.12
+            # Descuadre marcado al pensar: las caras se separan a lo largo
+            # de su normal (el eco fantasma va a contrafase de esto)
+            displacement = math.sin(t * 6.0 + c.idx) * 0.15
         elif state == "SPEAKING":
             react = self._speech_vol * 0.6
             center_first = (1.0 - dist_norm * 0.6) * react
             glow = 0.30 + center_first * 0.9 + react * 0.25
             scale = 1.0 + center_first * 0.18
             z_off = react * 0.18 * math.sin(t * 5.0 + dist_norm * 3.0)
-            displacement = react * 0.1
+            displacement = react * 0.16
 
         radial_scale = 1.0 + radial_wave * vol * 0.12 * (1.0 - dist_norm * 0.3)
         scale *= radial_scale
@@ -1154,6 +1176,8 @@ class VisualGLWidget(QOpenGLWidget):
         halo_t = _HALO_COLORS.get(state, _HALO_COLORS["IDLE"])
         color2_t = _COLORS2.get(state, _COLORS2["IDLE"])
 
+        echo_t = 1.0 if state == "PROCESSING" else 0.0
+
         k = 1.0 - math.exp(-dt / 0.18)
         self._color_cur = self._color_cur + (color_t - self._color_cur) * k
         self._halo_cur = self._halo_cur + (halo_t - self._halo_cur) * k
@@ -1161,6 +1185,7 @@ class VisualGLWidget(QOpenGLWidget):
         self._scan_cur += (scan_t - self._scan_cur) * k
         self._glitch_cur += (glitch_t - self._glitch_cur) * k
         self._fresnel_cur += (fresnel_t - self._fresnel_cur) * k
+        self._echo_cur += (echo_t - self._echo_cur) * k
 
     def _cleanup_gl(self):
         self.makeCurrent()
