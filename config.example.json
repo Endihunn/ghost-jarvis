@@ -5,11 +5,12 @@
   "gateway_url": "ws://127.0.0.1:18789",
   "gateway_token": "",
   "session_key": "",
-  "overlay_width": 420,
-  "overlay_height": 420,
+  "overlay_width": 320,
+  "overlay_height": 320,
   "overlay_centered": true,
   "overlay_x": null,
   "overlay_y": null,
+  "click_through": true,
   "wake_phrases": [
     "oye ghost",
     "oiga ghost",
@@ -47,6 +48,9 @@
   "grid_enabled": true,
   "wireframe_enabled": true,
   "glitch_enabled": true,
+  "bloom_enabled": true,
+  "bloom_intensity": 0.55,
+  "reflection_enabled": true,
   "privacy_mode": false,
   "custom_key": 123
 }

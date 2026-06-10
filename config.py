@@ -50,11 +50,14 @@ class Config:
     session_key: str = ""
 
     # Overlay geometry
-    overlay_width: int = 420
-    overlay_height: int = 420
+    overlay_width: int = 320
+    overlay_height: int = 320
     overlay_centered: bool = True
     overlay_x: Optional[int] = None
     overlay_y: Optional[int] = None
+    # Los clics atraviesan el overlay hacia las ventanas de atrás. Se
+    # desactiva temporalmente con "Modo mover" en el menú de la bandeja.
+    click_through: bool = True
 
     # Audio / Wake
     wake_phrases: List[str] = field(default_factory=lambda: [
@@ -112,8 +115,16 @@ class Config:
     particles_enabled: bool = True
     scanlines_enabled: bool = True
     grid_enabled: bool = True
+    # True = estilo cristal/aristas brillantes; False = caras sólidas con
+    # aristas sutiles. (Antes alternaba el wireframe GL_LINE legacy.)
     wireframe_enabled: bool = True
     glitch_enabled: bool = True
+    # Bloom HDR real (FBO 2-pass). Si el hardware no soporta los FBOs se
+    # cae solo al pase halo legacy.
+    bloom_enabled: bool = True
+    bloom_intensity: float = 0.55
+    # Reflejo de los cubos sobre el piso/grid
+    reflection_enabled: bool = True
 
     # Read-aloud monitor: speak replies from other sessions (the webchat) too.
     read_all_responses: bool = True
