@@ -58,9 +58,6 @@ from system_volume import save_and_duck, restore_volume
 
 WAKE_RESPONSES = get_jarvis_wake_responses()
 
-OVERLAY_WIDTH = APP_CONFIG.overlay_width
-OVERLAY_HEIGHT = APP_CONFIG.overlay_height
-
 # --- Local voice commands (handled without a round-trip to the agent) ---
 # Matched against the full post-wake utterance (lowercased, ≤4 words).
 _STOP_CMDS = {
@@ -93,6 +90,10 @@ class GhostJarvisApp(QMainWindow):
         self.setWindowTitle(f"{APP_CONFIG.agent_name} Jarvis")
         self._position_overlay()
         self._drag_pos = self.pos()
+        self._dragged = False
+        # "Modo mover": suspende el click-through para poder arrastrar el
+        # overlay desde el menú de la bandeja.
+        self._move_mode = False
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -344,6 +345,26 @@ class GhostJarvisApp(QMainWindow):
 
         menu.addSeparator()
 
+        act_move = QAction("Modo mover (arrastrar overlay)", self)
+        act_move.setCheckable(True)
+        act_move.setChecked(self._move_mode)
+        act_move.toggled.connect(self._set_move_mode)
+        menu.addAction(act_move)
+
+        act_center = QAction("Centrar overlay", self)
+        act_center.triggered.connect(self._center_overlay)
+        menu.addAction(act_center)
+
+        size_menu = menu.addMenu("Tamaño del overlay")
+        for label, px in (("Compacto (260)", 260), ("Normal (320)", 320), ("Grande (420)", 420)):
+            act_size = QAction(label, self)
+            act_size.setCheckable(True)
+            act_size.setChecked(int(APP_CONFIG.overlay_width) == px)
+            act_size.triggered.connect(lambda _=False, p=px: self._set_overlay_size(p))
+            size_menu.addAction(act_size)
+
+        menu.addSeparator()
+
         act_config = QAction("Configuración", self)
         act_config.triggered.connect(self._show_config_dialog)
         menu.addAction(act_config)
@@ -397,7 +418,8 @@ class GhostJarvisApp(QMainWindow):
             p.end()
             self.tray.setIcon(QIcon(px))
 
-        self.tray.setContextMenu(self._build_tray_menu())
+        self._tray_menu = self._build_tray_menu()
+        self.tray.setContextMenu(self._tray_menu)
         self.tray.activated.connect(self._tray_activated)
         self.tray.show()
 
@@ -435,6 +457,7 @@ class GhostJarvisApp(QMainWindow):
         dlg.finished.connect(lambda: setattr(self, '_config_dlg', None))
         if dlg.exec() == QDialog.DialogCode.Accepted:
             logging.getLogger("config").info("Config updated.")
+            self._apply_click_through(self._effective_click_through())
             if self.sm.state == State.STANDBY:
                 self._check_standby()
 
@@ -747,18 +770,98 @@ class GhostJarvisApp(QMainWindow):
             self.sm.transition(State.IDLE)
 
     def _position_overlay(self):
-        """Center the overlay on the primary screen."""
+        """Place the overlay: saved position if still on-screen, else centered."""
+        w = int(APP_CONFIG.overlay_width or 320)
+        h = int(APP_CONFIG.overlay_height or 320)
+        if (
+            not APP_CONFIG.overlay_centered
+            and APP_CONFIG.overlay_x is not None
+            and APP_CONFIG.overlay_y is not None
+        ):
+            rect = QRect(int(APP_CONFIG.overlay_x), int(APP_CONFIG.overlay_y), w, h)
+            # La posición guardada puede quedar fuera tras cambiar de monitor
+            if any(s.geometry().intersects(rect) for s in QApplication.screens()):
+                self.setGeometry(rect)
+                return
         screen = QApplication.primaryScreen()
         if screen:
             geo = screen.availableGeometry()
         else:
             geo = QRect(0, 0, 1920, 1080)
-        x = geo.x() + (geo.width() - OVERLAY_WIDTH) // 2
-        y = geo.y() + (geo.height() - OVERLAY_HEIGHT) // 2
-        self.setGeometry(x, y, OVERLAY_WIDTH, OVERLAY_HEIGHT)
+        x = geo.x() + (geo.width() - w) // 2
+        y = geo.y() + (geo.height() - h) // 2
+        self.setGeometry(x, y, w, h)
+
+    # ---- Click-through ------------------------------------------------
+    def _effective_click_through(self) -> bool:
+        return bool(APP_CONFIG.click_through) and not self._move_mode
+
+    def _apply_click_through(self, enabled: bool):
+        """Let mouse input pass through the overlay to the windows beneath.
+
+        On Windows the WS_EX_TRANSPARENT exstyle bit is flipped on the live
+        HWND (like Electron's setIgnoreMouseEvents): no window re-creation,
+        no flicker, and the GL context survives. Elsewhere we fall back to
+        Qt's WindowTransparentForInput flag, which re-creates the window.
+        """
+        if sys.platform == "win32":
+            try:
+                import win32gui
+                import win32con
+                hwnd = int(self.winId())
+                ex = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+                if enabled:
+                    new = ex | win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT
+                else:
+                    # WS_EX_LAYERED se queda: quitarlo cambia el modo de
+                    # render; solo la transparencia de hit-test se va.
+                    new = ex & ~win32con.WS_EX_TRANSPARENT
+                if new != ex:
+                    win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, new)
+                    if enabled and not (ex & win32con.WS_EX_LAYERED):
+                        # Una ventana que recién gana WS_EX_LAYERED no se
+                        # renderiza hasta esta llamada.
+                        win32gui.SetLayeredWindowAttributes(
+                            hwnd, 0, 255, win32con.LWA_ALPHA
+                        )
+            except Exception as e:
+                logging.getLogger("overlay").warning("click-through: %s", e)
+        else:
+            self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, enabled)
+            if self.isVisible():
+                self.show()
+
+    def _set_move_mode(self, enabled: bool):
+        self._move_mode = bool(enabled)
+        self._apply_click_through(self._effective_click_through())
+        # Refresh the persistent tray copy so its checkmark stays in sync
+        self._tray_menu = self._build_tray_menu()
+        self.tray.setContextMenu(self._tray_menu)
+
+    def _center_overlay(self):
+        APP_CONFIG.overlay_centered = True
+        APP_CONFIG.overlay_x = None
+        APP_CONFIG.overlay_y = None
+        APP_CONFIG.save()
+        self._position_overlay()
+
+    def _set_overlay_size(self, px: int):
+        APP_CONFIG.overlay_width = px
+        APP_CONFIG.overlay_height = px
+        APP_CONFIG.save()
+        self._position_overlay()
+        self._tray_menu = self._build_tray_menu()
+        self.tray.setContextMenu(self._tray_menu)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # En cada show: cubre el primer show, el "Mostrar" del tray, y
+        # re-aplica el exstyle si el HWND nativo se recreó.
+        self._apply_click_through(self._effective_click_through())
 
     def mousePressEvent(self, event):
         self._drag_pos = event.globalPosition().toPoint()
+        self._dragged = False
 
     def mouseMoveEvent(self, event):
         if event.buttons() == Qt.MouseButton.LeftButton:
@@ -766,6 +869,18 @@ class GhostJarvisApp(QMainWindow):
                 self.pos() + event.globalPosition().toPoint() - self._drag_pos
             )
             self._drag_pos = event.globalPosition().toPoint()
+            self._dragged = True
+
+    def mouseReleaseEvent(self, event):
+        # Persistir la posición solo al soltar (save() re-encripta secretos
+        # vía DPAPI; no debe llamarse por cada mouse-move).
+        if event.button() == Qt.MouseButton.LeftButton and self._dragged:
+            self._dragged = False
+            APP_CONFIG.overlay_x = self.x()
+            APP_CONFIG.overlay_y = self.y()
+            APP_CONFIG.overlay_centered = False
+            APP_CONFIG.save()
+        super().mouseReleaseEvent(event)
 
     def closeEvent(self, event):
         event.ignore()
