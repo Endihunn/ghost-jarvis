@@ -14,14 +14,16 @@ Asistente de escritorio tipo **J.A.R.V.I.S.** conectado al agente **main** de Op
 - **TTS local**: `pyttsx3` para frases de confirmación instantáneas
 - **TTS agente**: `edge-tts` + **efectos J.A.R.V.I.S.** (compresión, reverb, delay, chorus, pitch shift)
 - **Visual**: Interfaz holográfica high-tech con OpenGL 3.3:
-  - 9 cubos emisivos en rombo con fresnel glow
-  - 64 partículas orbitales
-  - Grid holográfico perspectivo
-  - Scanlines y glitch effects
+  - 9 cubos de cristal en rombo: aristas brillantes con antialiasing, caras de vidrio translúcido e iridiscencia sutil
+  - **Bloom HDR real** (2-pass gaussiano vía FBO, con fallback automático al halo legacy)
+  - Reflejo de los cubos sobre el grid holográfico del piso
+  - Transiciones de estado suavizadas (~180 ms de cross-fade de color)
+  - 64 partículas orbitales, scanlines y glitch effects
   - Anillos de expansión en transiciones
   - Reactividad al espectro de audio en tiempo real
 - **Transparencia real**: fondo completamente transparente, sin bordes de ventana
-- **Posición**: centrado en la pantalla principal (arrastrable)
+- **Click-through**: los clics atraviesan el overlay hacia lo que tengas detrás (configurable). Para moverlo: menú de bandeja → **«Modo mover»**, arrastra, y vuelve a desactivarlo; la posición se recuerda. También hay **«Centrar overlay»** y presets de **tamaño** (260/320/420) en la bandeja.
+- **Posición**: centrado en la pantalla principal o donde lo dejes
 - **Sonidos**: tonos generados proceduralmente para escuchar/dejar de escuchar
 - **Conexión Ghost**: vía `openclaw agent` (OpenClaw)
 - **Autoarranque Windows**: opción desde el menú de bandeja
@@ -91,7 +93,7 @@ O haz doble clic en el acceso directo de escritorio.
 
 ## Uso
 
-1. La app aparece como un overlay flotante **sin ventana ni fondo** (420×420 px) **centrado** en la pantalla. Es **arrastrable** con el ratón y siempre visible encima de todo.
+1. La app aparece como un overlay flotante **sin ventana ni fondo** (320×320 px por defecto) **centrado** en la pantalla, siempre visible encima de todo. Los clics lo **atraviesan**; para arrastrarlo activa **«Modo mover»** en el menú de la bandeja (y desactívalo al terminar).
 2. Di **"oye, ghost"** o **"jarvis"** — los cubos reaccionarán con anillos de expansión, sonará un tono y Jarvis dirá `"¿Sí, señor?"`.
 3. Habla tu prompt.
 4. Jarvis enviará el mensaje a Ghost y leerá la respuesta con voz robótica estilo J.A.R.V.I.S.

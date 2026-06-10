@@ -122,7 +122,7 @@ class Config:
     # Bloom HDR real (FBO 2-pass). Si el hardware no soporta los FBOs se
     # cae solo al pase halo legacy.
     bloom_enabled: bool = True
-    bloom_intensity: float = 0.55
+    bloom_intensity: float = 0.9
     # Reflejo de los cubos sobre el piso/grid
     reflection_enabled: bool = True
 

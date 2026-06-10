@@ -99,16 +99,18 @@ void main() {
     float mn = min(q.x, min(q.y, q.z));
     float med = q.x + q.y + q.z - mx - mn;
     float edgeDist = 1.0 - med;
-    float w = fwidth(edgeDist) * 1.5;
+    // Clamp: huge derivatives at silhouette pixels cause color sparkles
+    float w = clamp(fwidth(edgeDist) * 1.5, 0.004, 0.05);
     float edge = 1.0 - smoothstep(uEdgeWidth - w, uEdgeWidth + w, edgeDist);
 
     // Glass mode: faint faces, the edges carry the form
     if (uGlassMode > 0.5) {
         c *= 0.55;
-        a = a * 0.16 + fresnel * 0.22;
+        a = a * 0.22 + fresnel * 0.26;
     }
-    c += mix(uColor, vec3(1.0), 0.35) * edge * (0.6 + uGlow * 1.4);
-    a += edge * (uGlassMode > 0.5 ? 0.55 : 0.25);
+    // HDR edges (>1) feed the bloom bright-pass
+    c += mix(uColor, vec3(1.0), 0.35) * edge * (1.3 + uGlow * 1.8);
+    a += edge * (uGlassMode > 0.5 ? 0.65 : 0.30);
 
     // Soft top light
     c *= 0.92 + 0.16 * clamp(vLocalPos.y + 0.5, 0.0, 1.0);
@@ -299,9 +301,14 @@ _COPY_FRAG = """
 in vec2 vUV;
 uniform sampler2D uTex;
 uniform float uIntensity;
+uniform float uTonemap;
 out vec4 FragColor;
 void main() {
-    FragColor = texture(uTex, vUV) * uIntensity;
+    vec4 s = texture(uTex, vUV);
+    // Optional Reinhard: compress HDR bloom peaks so they don't clip
+    // per-channel (which reads as hue shifts / color sparkles).
+    s.rgb = mix(s.rgb, s.rgb / (1.0 + max(s.rgb, vec3(0.0))), uTonemap);
+    FragColor = s * uIntensity;
 }
 """
 
@@ -532,6 +539,7 @@ class VisualGLWidget(QOpenGLWidget):
             self._cuni = {
                 "uTex": glGetUniformLocation(self._copy_prog, "uTex"),
                 "uIntensity": glGetUniformLocation(self._copy_prog, "uIntensity"),
+                "uTonemap": glGetUniformLocation(self._copy_prog, "uTonemap"),
             }
             self._bloom_ok = True
         except Exception as e:
@@ -721,6 +729,7 @@ class VisualGLWidget(QOpenGLWidget):
                 return
             self._bloom_size = (w, h)
             self._blur_size = (bw, bh)
+            logger.info("Bloom pipeline active (%dx%d, blur %dx%d)", w, h, bw, bh)
         except Exception as e:
             logger.warning("Bloom FBO setup failed (%s); legacy halo pass.", e)
             self._destroy_bloom_targets()
@@ -825,7 +834,7 @@ class VisualGLWidget(QOpenGLWidget):
             glBindVertexArray(self._vao)
             col2 = self._color2_cur
             glUniform3f(self._uni["uColor2"], col2.x(), col2.y(), col2.z())
-            glUniform1f(self._uni["uEdgeWidth"], 0.07)
+            glUniform1f(self._uni["uEdgeWidth"], 0.22)
             glUniform1f(self._uni["uGlassMode"], 1.0 if APP_CONFIG.wireframe_enabled else 0.0)
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
             glDepthMask(GL_FALSE)
@@ -838,7 +847,7 @@ class VisualGLWidget(QOpenGLWidget):
             rot_mirror = mirror * rot
             for c in self._cubes:
                 # Desvanecer con la altura: solo los cubos bajos reflejan
-                fade = 0.20 * max(0.0, 1.0 - (c.y - _FLOOR_Y) / 1.6)
+                fade = 0.15 * max(0.0, 1.0 - (c.y - _FLOOR_Y) / 1.6)
                 if fade <= 0.005:
                     continue
                 dist = math.sqrt(c.x * c.x + c.y * c.y)
@@ -863,7 +872,7 @@ class VisualGLWidget(QOpenGLWidget):
             glUniformMatrix4fv(self._guni["uMVP"], 1, GL_FALSE, self._mvp_buf)
             glUniform1f(self._guni["uTime"], t)
             glUniform3f(self._guni["uColor"], base_col.x(), base_col.y(), base_col.z())
-            glUniform1f(self._guni["uIntensity"], 0.3 if animated else 0.15)
+            glUniform1f(self._guni["uIntensity"], 0.4 if animated else 0.22)
             glBlendFunc(GL_SRC_ALPHA, GL_ONE)
             glDrawArrays(GL_TRIANGLES, 0, 6)
             glBindVertexArray(0)
@@ -876,13 +885,16 @@ class VisualGLWidget(QOpenGLWidget):
         # alternaba el wireframe GL_LINE legacy).
         col2 = self._color2_cur
         glUniform3f(self._uni["uColor2"], col2.x(), col2.y(), col2.z())
-        glUniform1f(self._uni["uEdgeWidth"], 0.07)
+        glUniform1f(self._uni["uEdgeWidth"], 0.22)
         glUniform1f(self._uni["uGlassMode"], 1.0 if APP_CONFIG.wireframe_enabled else 0.0)
         glUniform1f(self._uni["uAlphaMul"], 1.0)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE)
         # Camino legacy únicamente: con bloom real el glow sale del
         # post-proceso, no de redibujar los cubos escalados.
         if not use_bloom:
+            # Sin aristas en los cubos-halo: a escala 1.6-3.8x se verían
+            # como cubos duplicados, no como resplandor.
+            glUniform1f(self._uni["uEdgeWidth"], 0.0)
             for c in self._cubes:
                 dist = math.sqrt(c.x * c.x + c.y * c.y)
                 dist_norm = min(dist / max_dist, 1.0)
@@ -897,6 +909,7 @@ class VisualGLWidget(QOpenGLWidget):
                 )
 
         # ---- SOLID PASS ----
+        glUniform1f(self._uni["uEdgeWidth"], 0.22)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         for c in self._cubes:
             dist = math.sqrt(c.x * c.x + c.y * c.y)
@@ -975,7 +988,9 @@ class VisualGLWidget(QOpenGLWidget):
         glUseProgram(self._bright_prog)
         glBindTexture(GL_TEXTURE_2D, self._scene_tex)
         glUniform1i(self._buni["uTex"], 0)
-        glUniform1f(self._buni["uThreshold"], 0.85)
+        # 0.60 + soft knee: IDLE edges (luma ~1.0) already glow softly;
+        # active states amplify naturally.
+        glUniform1f(self._buni["uThreshold"], 0.60)
         glDrawArrays(GL_TRIANGLES, 0, 3)
 
         # Blur gaussiano separable: H (ping0->ping1), V (ping1->ping0)
@@ -1003,13 +1018,16 @@ class VisualGLWidget(QOpenGLWidget):
         #    directo (crítico para la ventana translúcida / DWM).
         glBindTexture(GL_TEXTURE_2D, self._scene_tex)
         glUniform1f(self._cuni["uIntensity"], 1.0)
+        glUniform1f(self._cuni["uTonemap"], 0.0)
         glDrawArrays(GL_TRIANGLES, 0, 3)
         # 2) Bloom aditivo en color Y alpha (DWM compone por alpha de
-        #    ventana; RGB aditivo con alpha 0 sería invisible).
+        #    ventana; RGB aditivo con alpha 0 sería invisible). Tonemap ON
+        #    para que los picos HDR no clipeen por canal.
         glEnable(GL_BLEND)
         glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ONE)
         glBindTexture(GL_TEXTURE_2D, self._ping_tex[0])
         glUniform1f(self._cuni["uIntensity"], max(0.0, float(APP_CONFIG.bloom_intensity)))
+        glUniform1f(self._cuni["uTonemap"], 1.0)
         glDrawArrays(GL_TRIANGLES, 0, 3)
 
         # Restaurar estado para el siguiente frame / camino legacy
@@ -1125,7 +1143,8 @@ class VisualGLWidget(QOpenGLWidget):
         state = self._state
         animated = state in ("WAKE", "PROCESSING", "SPEAKING")
         scan_t = 0.3 if state == "PROCESSING" else (0.1 if animated else 0.0)
-        glitch_t = 0.15 if state == "PROCESSING" else 0.0
+        # 0.08: strong glitch reads as dirt on the crystal material
+        glitch_t = 0.08 if state == "PROCESSING" else 0.0
         if not APP_CONFIG.scanlines_enabled:
             scan_t = 0.0
         if not APP_CONFIG.glitch_enabled:
