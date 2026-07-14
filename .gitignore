@@ -1,0 +1,96 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# PyInstaller
+*.manifest
+*.spec
+!build_scripts/common/*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Logs
+*.log
+logs/
+
+# Runtime caches
+assets/jarvis_cache/
+assets/tts_cache/
+*.tmp
+*.temp
+
+# Local configuration (contains encrypted credentials)
+config.json
+
+# Whisper / ML models (downloaded at runtime, too large for git)
+models/
+!models/.gitkeep
+
+# Build artifacts
+*.msi
+*.exe
+*.pkg
+*.deb
+*.rpm
+*.AppImage
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Benchmark reports
+benchmarks/*.md
+
+# Junk files
+)
+
+# Distribution archives
+*.zip
