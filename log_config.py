@@ -15,14 +15,30 @@ from logging.handlers import RotatingFileHandler
 class _StreamToLogger:
     """Redirect a text stream into the Python logging system so stdout/stderr
     also go through the rotating file handler (avoids unbounded app.log).
+
+    Guarded against recursion: if logging itself fails, the error handler
+    writes to the original stderr instead of looping back into this object.
     """
     def __init__(self, logger_name: str, level: int = logging.INFO):
         self._logger = logging.getLogger(logger_name)
         self._level = level
+        self._in_write = False
 
     def write(self, buf: str) -> None:
-        for line in buf.rstrip().splitlines():
-            self._logger.log(self._level, line.rstrip())
+        if self._in_write or not buf:
+            return
+        self._in_write = True
+        try:
+            for line in buf.rstrip().splitlines():
+                self._logger.log(self._level, line.rstrip())
+        except Exception:
+            # Prevent recursion: if logging fails, write to original stderr
+            try:
+                sys.__stderr__.write(buf)
+            except Exception:
+                pass
+        finally:
+            self._in_write = False
 
     def flush(self) -> None:
         pass

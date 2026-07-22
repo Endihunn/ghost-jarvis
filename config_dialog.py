@@ -193,6 +193,26 @@ class ConfigDialog(QDialog):
         self._jarvis_pitch.setSuffix(" semitonos")
         voice_form.addRow("Pitch shift:", self._jarvis_pitch)
 
+        # Speech speed slider
+        speed_widget = QWidget()
+        speed_layout = QHBoxLayout(speed_widget)
+        speed_layout.setContentsMargins(0, 0, 0, 0)
+        self._speech_speed = QSlider(Qt.Orientation.Horizontal)
+        self._speech_speed.setRange(50, 200)
+        self._speech_speed.setValue(100)
+        self._speech_speed.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self._speech_speed.setTickInterval(25)
+        self._speech_label = QLabel("100%")
+        self._speech_label.setFixedWidth(40)
+        self._speech_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._speech_speed.valueChanged.connect(
+            lambda v: self._speech_label.setText(f"{v}%")
+        )
+        speed_layout.addWidget(QLabel("Velocidad:"))
+        speed_layout.addWidget(self._speech_speed)
+        speed_layout.addWidget(self._speech_label)
+        voice_form.addRow("Velocidad de voz:", speed_widget)
+
         self._jarvis_compressor = QCheckBox("Compresión tipo radio")
         voice_form.addRow(self._jarvis_compressor)
         voice_group.setLayout(voice_form)
@@ -296,6 +316,9 @@ class ConfigDialog(QDialog):
         self._jarvis_delay.setValue(APP_CONFIG.jarvis_delay)
         self._jarvis_pitch.setValue(APP_CONFIG.jarvis_pitch_shift)
         self._jarvis_compressor.setChecked(APP_CONFIG.jarvis_compressor)
+        speed = APP_CONFIG.speech_speed
+        self._speech_speed.setValue(speed)
+        self._speech_label.setText(f"{speed}%")
         self._vis_fps.setValue(APP_CONFIG.visual_fps)
         self._vis_quality.setCurrentText(APP_CONFIG.visual_quality)
         self._particles.setChecked(APP_CONFIG.particles_enabled)
@@ -356,6 +379,10 @@ class ConfigDialog(QDialog):
         APP_CONFIG.jarvis_delay = self._jarvis_delay.value()
         APP_CONFIG.jarvis_pitch_shift = self._jarvis_pitch.value()
         APP_CONFIG.jarvis_compressor = self._jarvis_compressor.isChecked()
+        speed = self._speech_speed.value()
+        APP_CONFIG.speech_speed = speed
+        APP_CONFIG.tts_local_rate = int(speed * 200 / 100)
+        APP_CONFIG.tts_rate = f"{(speed - 100):+d}%"
         APP_CONFIG.visual_fps = self._vis_fps.value()
         APP_CONFIG.visual_quality = self._vis_quality.currentText()
         APP_CONFIG.particles_enabled = self._particles.isChecked()

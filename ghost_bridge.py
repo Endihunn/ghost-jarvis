@@ -12,6 +12,7 @@ One in-flight request at a time (matches ghost-jarvis usage pattern).
 Auto-detects disconnection in recv loop; next send_message reconnects.
 """
 import base64
+import fnmatch
 import json
 import logging
 import os
@@ -262,11 +263,11 @@ class GatewayWS:
             except Exception as e:
                 logger.warning("chat.subscribe failed for %s: %s", sk, e)
 
-    def connect(self, timeout: float = 30.0) -> bool:
+    def connect(self, timeout: float = 60.0) -> bool:
         with self._connect_lock:
             return self._connect_locked(timeout)
 
-    def _connect_locked(self, timeout: float) -> bool:
+    def _connect_locked(self, timeout: float = 60.0) -> bool:
         with self._state_lock:
             if self._connected:
                 return True
@@ -289,6 +290,9 @@ class GatewayWS:
 
         sock = None
         try:
+            # Timeout finito SOLO para el handshake; tras conectar, el recv
+            # loop baja a settimeout(65) + guard de idle de 90s. Un handshake
+            # mudo aborta aquí y el supervisor reintenta con backoff.
             sock = socket.create_connection((host, port), timeout=timeout)
             sock.settimeout(timeout)
 
@@ -421,7 +425,7 @@ class GatewayWS:
         message: str,
         agent_id: str = "main",
         session_key: str = "",
-        timeout: float = 600.0,
+        timeout: float = 0.0,
         on_delta: Optional[Callable[[str], None]] = None,
     ) -> str:
         """Send a chat message and wait for the final reply.
@@ -430,6 +434,11 @@ class GatewayWS:
         text fragment as the agent streams (the gateway sends cumulative
         snapshots; only the unseen suffix is delivered). Exceptions from the
         callback are swallowed so they can't kill the recv loop.
+
+        Espera con watchdog de INACTIVIDAD (config.send_inactivity_timeout):
+        mientras lleguen deltas la operación puede durar lo que sea; solo un
+        silencio total prolongado aborta. `timeout` > 0 añade además un tope
+        total opcional; 0 = sin tope.
         """
         if not self._connected:
             raise ConnectionError("Not connected to gateway")
@@ -451,6 +460,7 @@ class GatewayWS:
             "cancelled": False,
             "req_id": req_id,   # match the chat.send res (ok/err)
             "on_delta": on_delta,
+            "last_activity": time.monotonic(),
         }
 
         with self._pending_lock:
@@ -471,10 +481,22 @@ class GatewayWS:
                 self._pending.pop(session_key, None)
             raise ConnectionError(f"Send failed: {e}") from e
 
-        if not done.wait(timeout=timeout):
-            with self._pending_lock:
-                self._pending.pop(session_key, None)
-            raise TimeoutError(f"Agent did not respond within {timeout:.0f}s")
+        inactivity = float(getattr(APP_CONFIG, "send_inactivity_timeout", 300) or 0)
+        total_cap = timeout if timeout and timeout != float('inf') else 0.0
+        started = time.monotonic()
+        while not done.wait(timeout=15.0):
+            now = time.monotonic()
+            idle = now - entry["last_activity"]
+            if inactivity and idle > inactivity:
+                with self._pending_lock:
+                    self._pending.pop(session_key, None)
+                raise TimeoutError(
+                    f"Agente sin actividad por {idle:.0f}s (watchdog)"
+                )
+            if total_cap and now - started > total_cap:
+                with self._pending_lock:
+                    self._pending.pop(session_key, None)
+                raise TimeoutError(f"Tope total de {total_cap:.0f}s excedido")
 
         with self._pending_lock:
             entry = self._pending.pop(session_key, entry)
@@ -581,12 +603,14 @@ class GatewayWS:
                         entry = self._pending.get(sk)
 
                     if not entry:
-                        # Not one of our own requests. If it's a session we
-                        # passively monitor (e.g. the webchat), accumulate its
-                        # text and deliver the final to the read-aloud callback.
-                        if sk in self._monitor_sessions:
-                            self._handle_foreign_event(sk, run_id, state, message_data)
+                        # Sesiones ajenas: se leen en voz alta según la
+                        # política (denylist configurable) de _handle_foreign_event.
+                        self._handle_foreign_event(sk, run_id, state, message_data)
                         continue
+
+                    # Cualquier evento de la sesión cuenta como actividad
+                    # para el watchdog de send_message.
+                    entry["last_activity"] = time.monotonic()
 
                     # Accumulate text from delta/final
                     if state in ("delta", "final") and message_data:
@@ -644,6 +668,24 @@ class GatewayWS:
             self._foreign_buffers.clear()
             logger.warning("Gateway WS recv loop exited")
 
+    def _foreign_session_allowed(self, sk: str) -> bool:
+        """Política de lectura en voz alta para sesiones ajenas.
+
+        - read_all_responses=False → solo las sesiones monitoreadas explícitas
+          (comportamiento estricto original).
+        - read_all_responses=True → todas las sesiones interactivas, EXCEPTO
+          las que matcheen voice_session_denylist (crons, heartbeats, runs
+          isolated del gateway), fnmatch case-insensitive.
+        """
+        if not APP_CONFIG.read_all_responses:
+            return sk in self._monitor_sessions
+        key = (sk or "").lower()
+        for pat in getattr(APP_CONFIG, "voice_session_denylist", []) or []:
+            if fnmatch.fnmatch(key, pat.lower()):
+                logger.info("read-aloud omitido (denylist %r): %s", pat, sk)
+                return False
+        return True
+
     def _handle_foreign_event(self, sk: str, run_id: str, state: str,
                               message_data: dict) -> None:
         """Accumulate a monitored session's streaming text and fire the
@@ -656,6 +698,9 @@ class GatewayWS:
         a run's final could deliver the wrong/empty text and one reply was
         lost. Per-run buffers keep them independent.
         """
+        if not self._foreign_session_allowed(sk):
+            return
+
         key = run_id or sk
         buf = self._foreign_buffers.get(key)
         if buf is None:
@@ -767,7 +812,6 @@ class GhostWorker(QThread):
                 prompt,
                 agent_id="main",
                 session_key=APP_CONFIG.session_key,
-                timeout=600.0,
                 on_delta=_on_delta,
             )
         except CancelledError:

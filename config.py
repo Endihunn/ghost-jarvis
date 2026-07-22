@@ -83,6 +83,7 @@ class Config:
     tts_voice: str = "es-MX-JorgeNeural"
     tts_rate: str = "+5%"
     tts_local_rate: int = 185
+    speech_speed: int = 100  # porcentaje 50-200, controla tts_rate y tts_local_rate juntos
 
     # Conversación fluida (v1.1)
     # streaming_tts: hablar oración por oración conforme el agente streamea,
@@ -129,6 +130,16 @@ class Config:
     # Read-aloud monitor: speak replies from other sessions (the webchat) too.
     read_all_responses: bool = True
     monitor_session: str = "main"
+    # Sesiones cuyo texto NO se lee en voz alta (patrones fnmatch sobre el
+    # sessionKey calificado, case-insensitive). Cubre crons/heartbeats/runs
+    # isolated del gateway para que Jarvis no hable solo cada que corre un job.
+    voice_session_denylist: List[str] = field(default_factory=lambda: [
+        "*cron*", "*isolated*", "*heartbeat*", "*healthcheck*", "*health-check*",
+    ])
+    # Watchdog de send_message: segundos sin actividad del agente (sin deltas
+    # ni eventos) antes de abortar la espera. 0 = desactivado. Las operaciones
+    # largas que SÍ streamean nunca expiran.
+    send_inactivity_timeout: int = 300
 
     # Privacy
     privacy_mode: bool = False
